@@ -96,8 +96,8 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 - `--capture-dir <PATH>` — Directory for saving animated GIFs from `capture_frames` (defaults to OS temp dir).
 - `--default-width <PX>` / `--default-height <PX>` — Default window size on `launch`.
 - `--build-timeout-secs <SECS>` (default: `300`) — Timeout for `cargo build`.
-- `--max-image-width <PX>` (default: `1024`) — Max width of screenshots returned to the MCP client (`0` disables downscaling).
-- `--default-max-frames <N>` (default: `5`) — Default max frames returned in chat by `capture_frames`.
+- `--max-image-width <PX>` (default: `1920`) — Max width of screenshots returned to the MCP client (`0` disables downscaling).
+- `--default-max-frames <N>` (default: `3`) — Default max frames returned in chat by `capture_frames`.
 - `--log-level <LEVEL>` (default: `info`) — Tracing log level (written to `stderr`).
 
 ## Architecture

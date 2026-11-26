@@ -29,7 +29,7 @@ pub struct CaptureFramesParams {
     pub duration_ms: Option<u64>,
     /// Target capture frame rate in frames per second (default: 8, max: 30).
     pub fps: Option<u32>,
-    /// Maximum number of evenly spaced PNG frames to return in chat (default: 5, max: 12).
+    /// Maximum number of evenly spaced PNG frames to return in chat (default: 3, max: 12).
     pub max_frames: Option<usize>,
 }
 

@@ -8,7 +8,7 @@ use windows::core::{BOOL, Interface};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
 };
@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, DXGI_ERROR_UNSUPPORTED};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
 };
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -33,7 +33,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowRect,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, SW_RESTORE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
     ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
@@ -206,8 +206,26 @@ fn get_hwnd_info(hwnd: HWND) -> Result<WindowInfo> {
     }
 }
 
+/// Returns the screen-space client area rectangle (excluding title bar and window borders).
 fn get_window_bounds(hwnd: HWND) -> Result<WindowRect> {
     unsafe {
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client).is_ok() {
+            let mut origin = POINT { x: 0, y: 0 };
+            if ClientToScreen(hwnd, &mut origin).as_bool() {
+                let width = (client.right - client.left).max(0) as u32;
+                let height = (client.bottom - client.top).max(0) as u32;
+                if width > 0 && height > 0 {
+                    return Ok(WindowRect {
+                        x: origin.x,
+                        y: origin.y,
+                        width,
+                        height,
+                    });
+                }
+            }
+        }
+
         let mut rect = RECT::default();
         let dwm_res = DwmGetWindowAttribute(
             hwnd,
@@ -474,11 +492,11 @@ fn capture_with_print_window(hwnd: HWND) -> Result<CapturedFrame> {
             .map_err(|e| RustSightError::CaptureFailed(format!("CreateDIBSection: {e}")))?;
 
         let old_obj = SelectObject(hdc_mem, hbitmap.into());
-        // PW_RENDERFULLCONTENT = 2
-        let ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(2)).as_bool();
+        // PW_CLIENTONLY (1) | PW_RENDERFULLCONTENT (2) = 3 (client area only, no title bar)
+        let ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(3)).as_bool();
         if !ok {
-            warn!("PrintWindow returned false; attempting PW_CLIENTONLY=0");
-            let _ = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(0));
+            warn!("PrintWindow PW_CLIENTONLY|PW_RENDERFULLCONTENT returned false; attempting PW_CLIENTONLY=1");
+            let _ = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(1));
         }
 
         let len = (bounds.width * bounds.height * 4) as usize;
