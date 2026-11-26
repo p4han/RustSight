@@ -22,6 +22,26 @@ pub struct WindowIdParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct CropRegion {
+    /// Left X coordinate in screenshot pixels.
+    pub x: u32,
+    /// Top Y coordinate in screenshot pixels.
+    pub y: u32,
+    /// Width of the region in pixels.
+    pub width: u32,
+    /// Height of the region in pixels.
+    pub height: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScreenshotParams {
+    /// Target window ID. Defaults to the currently active launched window.
+    pub window_id: Option<WindowId>,
+    /// Optional sub-region to crop (saves tokens when inspecting a specific widget at 1:1 detail).
+    pub region: Option<CropRegion>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CaptureFramesParams {
     /// Target window ID. Defaults to the currently active launched window.
     pub window_id: Option<WindowId>,

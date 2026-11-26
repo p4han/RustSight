@@ -114,6 +114,49 @@ impl WindowCaptureBackend for WindowsCaptureBackend {
         }
     }
 
+    fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+        unsafe extern "system" fn enum_all(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            unsafe {
+                let list = &mut *(lparam.0 as *mut Vec<HWND>);
+                if !IsWindowVisible(hwnd).as_bool() {
+                    return BOOL(1);
+                }
+                let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
+                    return BOOL(1);
+                }
+                let has_owner = GetWindow(hwnd, GW_OWNER).is_ok();
+                let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+                if has_owner && !is_app_window {
+                    return BOOL(1);
+                }
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok()
+                    && (rect.right - rect.left) > 10
+                    && (rect.bottom - rect.top) > 10
+                {
+                    list.push(hwnd);
+                }
+                BOOL(1)
+            }
+        }
+
+        let mut hwnds: Vec<HWND> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(Some(enum_all), LPARAM(&mut hwnds as *mut _ as isize));
+        }
+
+        let mut out = Vec::new();
+        for hwnd in hwnds {
+            if let Ok(info) = get_hwnd_info(hwnd) {
+                if !info.title.is_empty() && info.rect.width > 0 && info.rect.height > 0 {
+                    out.push(info);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn get_window_info(&self, window_id: WindowId) -> Result<WindowInfo> {
         let hwnd = hwnd_from_id(window_id)?;
         get_hwnd_info(hwnd)

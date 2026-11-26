@@ -285,26 +285,66 @@ struct CargoTarget {
     kind: Vec<String>,
 }
 
-fn build_cargo_project(manifest_path: &Path, _timeout: Duration) -> Result<PathBuf> {
-    let output = Command::new("cargo")
+fn build_cargo_project(manifest_path: &Path, timeout: Duration) -> Result<PathBuf> {
+    use std::io::Read;
+
+    let mut child = Command::new("cargo")
         .arg("build")
         .arg("--manifest-path")
         .arg(manifest_path)
         .arg("--message-format=json")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()?;
+        .spawn()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut out) = stdout_pipe {
+            let _ = out.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut err) = stderr_pipe {
+            let _ = err.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RustSightError::BuildFailed {
+                path: manifest_path.display().to_string(),
+                code: None,
+                output: format!("`cargo build` timed out after {} seconds", timeout.as_secs()),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
         return Err(RustSightError::BuildFailed {
             path: manifest_path.display().to_string(),
-            code: output.status.code(),
+            code: status.code(),
             output: stderr,
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let mut found_exe: Option<PathBuf> = None;
     for line in stdout.lines() {
         if let Ok(msg) = serde_json::from_str::<CargoMessage>(line) {

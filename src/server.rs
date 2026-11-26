@@ -2,13 +2,13 @@ use crate::backend::{
     CapturedFrame, InputBackend, Modifiers, MouseButton, WindowCaptureBackend, WindowId,
     WindowInfo,
 };
-use crate::capture::{downscale_for_mcp, encode_gif, encode_png_base64, frames_differ};
+use crate::capture::{crop_frame, downscale_for_mcp, encode_gif, encode_png_base64, frames_differ};
 use crate::config::Config;
 use crate::error::{Result as AppResult, RustSightError};
 use crate::process::{LaunchSpec, ProcessManager};
 use crate::tools::{
-    CaptureFramesParams, ClickParams, DragParams, LaunchParams, PressKeyParams, ScrollParams,
-    TypeTextParams, WaitIdleParams, WindowIdParams,
+    CaptureFramesParams, ClickParams, DragParams, LaunchParams, PressKeyParams, ScreenshotParams,
+    ScrollParams, TypeTextParams, WaitIdleParams, WindowIdParams,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -144,17 +144,68 @@ impl RustSightServer {
         }
     }
 
-    /// Capture a PNG screenshot of the tracked window (or specified window_id).
+    /// List all visible top-level GUI windows (id, pid, title, size) so you can inspect already-running apps without `launch`.
+    #[tool(
+        name = "list_windows",
+        description = "List all visible top-level GUI windows with their window_id, pid, title, and size. Useful for attaching to an already-running app."
+    )]
+    async fn list_windows(&self) -> CallToolResult {
+        let this = self.clone();
+        let res = tokio::task::spawn_blocking(move || this.capture.list_windows()).await;
+        match res {
+            Ok(Ok(windows)) => {
+                let lines: Vec<String> = windows
+                    .into_iter()
+                    .map(|w| {
+                        format!(
+                            "window_id={} pid={} {}x{} `{}`",
+                            w.id, w.pid, w.rect.width, w.rect.height, w.title
+                        )
+                    })
+                    .collect();
+                let body = if lines.is_empty() {
+                    "No visible windows found.".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                CallToolResult::success(vec![Content::text(body)])
+            }
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
+        }
+    }
+
+    /// Capture a PNG screenshot of the tracked window (or specified window_id), optionally cropped to a sub-region.
     #[tool(
         name = "screenshot",
-        description = "Capture the current window pixels as a PNG screenshot. Works even if the window is partially covered."
+        description = "Capture the current window client area as a PNG screenshot. Optionally pass `region` ({x, y, width, height}) to crop to a specific widget and save tokens."
     )]
-    async fn screenshot(&self, Parameters(params): Parameters<WindowIdParams>) -> CallToolResult {
+    async fn screenshot(&self, Parameters(params): Parameters<ScreenshotParams>) -> CallToolResult {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
             let info = this.resolve_window(params.window_id)?;
-            let b64 = this.capture_and_encode(info.id)?;
-            Ok((info, b64))
+            if let Some(reg) = params.region {
+                let scale = this
+                    .coord_scales
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.get(&info.id).copied())
+                    .unwrap_or(1.0);
+                let frame = this.capture.capture_window(info.id)?;
+                let cropped = crop_frame(
+                    &frame,
+                    (reg.x as f64 * scale).round() as u32,
+                    (reg.y as f64 * scale).round() as u32,
+                    (reg.width as f64 * scale).round() as u32,
+                    (reg.height as f64 * scale).round() as u32,
+                )?;
+                let (scaled, _) = downscale_for_mcp(cropped, this.config.max_image_width)?;
+                let b64 = encode_png_base64(&scaled)?;
+                Ok((info, b64))
+            } else {
+                let b64 = this.capture_and_encode(info.id)?;
+                Ok((info, b64))
+            }
         })
         .await;
 

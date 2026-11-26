@@ -23,6 +23,31 @@ pub fn create_capture_backend() -> Box<dyn WindowCaptureBackend> {
     }
 }
 
+/// Crop a `CapturedFrame` to a sub-rectangle `(x, y, width, height)`, clamping to frame bounds.
+pub fn crop_frame(frame: &CapturedFrame, x: u32, y: u32, width: u32, height: u32) -> Result<CapturedFrame> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(RustSightError::Image("Cannot crop empty frame".into()));
+    }
+    let cx = x.min(frame.width.saturating_sub(1));
+    let cy = y.min(frame.height.saturating_sub(1));
+    let cw = width.max(1).min(frame.width - cx);
+    let ch = height.max(1).min(frame.height - cy);
+    let mut rgba = vec![0u8; (cw * ch * 4) as usize];
+    let src_stride = (frame.width * 4) as usize;
+    let dst_stride = (cw * 4) as usize;
+    for row in 0..ch as usize {
+        let src_off = (cy as usize + row) * src_stride + (cx as usize * 4);
+        let dst_off = row * dst_stride;
+        rgba[dst_off..dst_off + dst_stride]
+            .copy_from_slice(&frame.rgba[src_off..src_off + dst_stride]);
+    }
+    Ok(CapturedFrame {
+        width: cw,
+        height: ch,
+        rgba,
+    })
+}
+
 /// Downscale a frame with Lanczos3 if `max_width > 0 && frame.width > max_width`.
 /// Returns `(scaled_frame, coord_scale)` where `coord_scale = orig_width / new_width`.
 pub fn downscale_for_mcp(frame: CapturedFrame, max_width: u32) -> Result<(CapturedFrame, f64)> {

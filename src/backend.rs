@@ -86,6 +86,9 @@ pub trait WindowCaptureBackend: Send + Sync {
     /// Find the main visible top-level window belonging to `pid` (or its child processes).
     fn find_window_by_pid(&self, pid: u32) -> Result<Option<WindowInfo>>;
 
+    /// List all visible top-level application windows.
+    fn list_windows(&self) -> Result<Vec<WindowInfo>>;
+
     /// Get updated metadata for a specific window.
     fn get_window_info(&self, window_id: WindowId) -> Result<WindowInfo>;
 
