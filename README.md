@@ -12,15 +12,19 @@
 
 ## Install
 
+Point your AI coding agent (Claude Code, Cursor, Antigravity, etc.) at this repository and ask:
+
+> *"Install the RustSight skill & MCP server from https://github.com/p4han/RustSight"*
+
+Your agent will follow [SKILL.md](SKILL.md) to install the `rustsight` binary and register the MCP server automatically.
+
+Or install manually with Cargo:
+
 ```powershell
 cargo install --git https://github.com/p4han/RustSight
 ```
 
 This installs the `rustsight` MCP server binary onto your Cargo `PATH` (`%USERPROFILE%\.cargo\bin\rustsight.exe`).
-
-## Demo
-
-![RustSight Demo](docs/demo.gif)
 
 ## Quick Start
 
