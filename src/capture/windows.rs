@@ -388,15 +388,41 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
             .Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .map_err(|e| RustSightError::CaptureFailed(format!("Map staging texture: {e}")))?;
 
-        let width = desc.Width;
-        let height = desc.Height;
+        let tex_w = desc.Width;
+        let tex_h = desc.Height;
         let row_pitch = mapped.RowPitch as usize;
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
 
+        // WGC captures the full GetWindowRect (including invisible DWM drop-shadow borders).
+        // Crop to DWMWA_EXTENDED_FRAME_BOUNDS so the image has no black/shadow border and
+        // coordinates align 1:1 with get_window_bounds().
+        let mut full_rect = RECT::default();
+        let (crop_x, crop_y, crop_w, crop_h) = if GetWindowRect(hwnd, &mut full_rect).is_ok() {
+            if let Ok(ext) = get_window_bounds(hwnd) {
+                let ox = (ext.x - full_rect.left).max(0) as u32;
+                let oy = (ext.y - full_rect.top).max(0) as u32;
+                let cw = ext.width.min(tex_w.saturating_sub(ox));
+                let ch = ext.height.min(tex_h.saturating_sub(oy));
+                if cw > 0 && ch > 0 {
+                    (ox, oy, cw, ch)
+                } else {
+                    (0, 0, tex_w, tex_h)
+                }
+            } else {
+                (0, 0, tex_w, tex_h)
+            }
+        } else {
+            (0, 0, tex_w, tex_h)
+        };
+
+        let mut rgba = vec![0u8; (crop_w * crop_h * 4) as usize];
         let src_ptr = mapped.pData as *const u8;
-        for y in 0..height as usize {
-            let src_row = std::slice::from_raw_parts(src_ptr.add(y * row_pitch), (width * 4) as usize);
-            let dst_row = &mut rgba[y * (width as usize * 4)..(y + 1) * (width as usize * 4)];
+        for y in 0..crop_h as usize {
+            let src_y = y + crop_y as usize;
+            let src_row = std::slice::from_raw_parts(
+                src_ptr.add(src_y * row_pitch + (crop_x as usize * 4)),
+                (crop_w * 4) as usize,
+            );
+            let dst_row = &mut rgba[y * (crop_w as usize * 4)..(y + 1) * (crop_w as usize * 4)];
             for (src_px, dst_px) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
                 // BGRA -> RGBA
                 dst_px[0] = src_px[2];
@@ -411,8 +437,8 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
         let _ = pool.Close();
 
         Ok(CapturedFrame {
-            width,
-            height,
+            width: crop_w,
+            height: crop_h,
             rgba,
         })
     }

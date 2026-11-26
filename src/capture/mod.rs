@@ -5,7 +5,8 @@ use crate::backend::{CapturedFrame, WindowCaptureBackend};
 use crate::error::{Result, RustSightError};
 use base64::Engine;
 use image::codecs::gif::{GifEncoder, Repeat};
-use image::codecs::png::PngEncoder;
+use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
+use image::imageops::FilterType as ResizeFilter;
 use image::{Delay, Frame, ImageEncoder, RgbaImage};
 use std::fs::File;
 use std::io::BufWriter;
@@ -22,10 +23,33 @@ pub fn create_capture_backend() -> Box<dyn WindowCaptureBackend> {
     }
 }
 
-/// Encode a `CapturedFrame` (RGBA8) into PNG bytes.
+/// Downscale a frame with Lanczos3 if `max_width > 0 && frame.width > max_width`.
+/// Returns `(scaled_frame, coord_scale)` where `coord_scale = orig_width / new_width`.
+pub fn downscale_for_mcp(frame: CapturedFrame, max_width: u32) -> Result<(CapturedFrame, f64)> {
+    if max_width == 0 || frame.width <= max_width || frame.width == 0 || frame.height == 0 {
+        return Ok((frame, 1.0));
+    }
+    let scale = frame.width as f64 / max_width as f64;
+    let new_w = max_width;
+    let new_h = ((frame.height as f64) / scale).round().max(1.0) as u32;
+    let src = RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+        .ok_or_else(|| RustSightError::Image("Invalid RGBA buffer dimensions".into()))?;
+    let resized = image::imageops::resize(&src, new_w, new_h, ResizeFilter::Lanczos3);
+    Ok((
+        CapturedFrame {
+            width: new_w,
+            height: new_h,
+            rgba: resized.into_raw(),
+        },
+        scale,
+    ))
+}
+
+/// Encode a `CapturedFrame` (RGBA8) into high-compression PNG bytes.
 pub fn encode_png(frame: &CapturedFrame) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    let encoder = PngEncoder::new(&mut buf);
+    let encoder =
+        PngEncoder::new_with_quality(&mut buf, CompressionType::Best, PngFilterType::Adaptive);
     encoder
         .write_image(
             &frame.rgba,
@@ -56,7 +80,8 @@ pub fn encode_gif(frames: &[CapturedFrame], delay_ms: u32, path: &Path) -> Resul
 
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
-    let mut encoder = GifEncoder::new_with_speed(writer, 10);
+    // Speed 2 gives crisp NeuQuant color quantization without banding.
+    let mut encoder = GifEncoder::new_with_speed(writer, 2);
     encoder
         .set_repeat(Repeat::Infinite)
         .map_err(|e| RustSightError::Image(e.to_string()))?;

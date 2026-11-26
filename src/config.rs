@@ -25,6 +25,14 @@ pub struct Config {
     #[arg(long, default_value_t = 300)]
     pub build_timeout_secs: u64,
 
+    /// Maximum width (px) of screenshots returned to the MCP client (0 = no downscaling).
+    #[arg(long, default_value_t = 1024)]
+    pub max_image_width: u32,
+
+    /// Default maximum number of frames returned by `capture_frames` in chat.
+    #[arg(long, default_value_t = 5)]
+    pub default_max_frames: usize,
+
     /// Log level filter (e.g., info, debug, warn, error). Logs go to stderr.
     #[arg(long, default_value = "info")]
     pub log_level: String,

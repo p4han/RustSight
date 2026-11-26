@@ -2,7 +2,7 @@ use crate::backend::{
     CapturedFrame, InputBackend, Modifiers, MouseButton, WindowCaptureBackend, WindowId,
     WindowInfo,
 };
-use crate::capture::{encode_gif, encode_png_base64, frames_differ};
+use crate::capture::{downscale_for_mcp, encode_gif, encode_png_base64, frames_differ};
 use crate::config::Config;
 use crate::error::{Result as AppResult, RustSightError};
 use crate::process::{LaunchSpec, ProcessManager};
@@ -14,6 +14,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,7 @@ pub struct RustSightServer {
     capture: Arc<Box<dyn WindowCaptureBackend>>,
     input: Arc<Box<dyn InputBackend>>,
     processes: Arc<Mutex<ProcessManager>>,
+    coord_scales: Arc<Mutex<HashMap<WindowId, f64>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -38,6 +40,7 @@ impl RustSightServer {
             capture: Arc::new(capture),
             input: Arc::new(input),
             processes: Arc::new(Mutex::new(ProcessManager::new())),
+            coord_scales: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -59,11 +62,32 @@ impl RustSightServer {
         self.capture.get_window_info(wid)
     }
 
+    fn capture_and_encode(&self, wid: WindowId) -> AppResult<String> {
+        let frame = self.capture.capture_window(wid)?;
+        let (scaled, scale) = downscale_for_mcp(frame, self.config.max_image_width)?;
+        if let Ok(mut scales) = self.coord_scales.lock() {
+            scales.insert(wid, scale);
+        }
+        encode_png_base64(&scaled)
+    }
+
+    fn scale_coords(&self, wid: WindowId, x: i32, y: i32) -> (i32, i32) {
+        let scale = self
+            .coord_scales
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&wid).copied())
+            .unwrap_or(1.0);
+        (
+            (x as f64 * scale).round() as i32,
+            (y as f64 * scale).round() as i32,
+        )
+    }
+
     fn settle_and_capture(&self, wid: WindowId) -> AppResult<(WindowInfo, String)> {
         std::thread::sleep(Duration::from_millis(self.config.settle_ms));
         let info = self.capture.get_window_info(wid)?;
-        let frame = self.capture.capture_window(wid)?;
-        let b64 = encode_png_base64(&frame)?;
+        let b64 = self.capture_and_encode(wid)?;
         Ok((info, b64))
     }
 
@@ -102,8 +126,7 @@ impl RustSightServer {
                 })?;
                 pm.launch(spec, this.capture.as_ref().as_ref(), timeout)?
             };
-            let frame = this.capture.capture_window(info.id)?;
-            let b64 = encode_png_base64(&frame)?;
+            let b64 = this.capture_and_encode(info.id)?;
             Ok((info, b64))
         })
         .await;
@@ -130,8 +153,7 @@ impl RustSightServer {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
             let info = this.resolve_window(params.window_id)?;
-            let frame = this.capture.capture_window(info.id)?;
-            let b64 = encode_png_base64(&frame)?;
+            let b64 = this.capture_and_encode(info.id)?;
             Ok((info, b64))
         })
         .await;
@@ -161,8 +183,12 @@ impl RustSightServer {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Vec<String>, String, usize)> {
             let info = this.resolve_window(params.window_id)?;
-            let duration_ms = params.duration_ms.unwrap_or(1500).clamp(100, 10_000);
-            let fps = params.fps.unwrap_or(10).clamp(1, 30);
+            let duration_ms = params.duration_ms.unwrap_or(1200).clamp(100, 10_000);
+            let fps = params.fps.unwrap_or(8).clamp(1, 30);
+            let max_images = params
+                .max_frames
+                .unwrap_or(this.config.default_max_frames)
+                .clamp(1, 12);
             let interval = Duration::from_secs_f64(1.0 / fps as f64);
 
             let start = Instant::now();
@@ -199,18 +225,24 @@ impl RustSightServer {
             let delay_ms = (1000 / fps).max(20);
             encode_gif(&frames, delay_ms, &gif_path)?;
 
-            // Sample up to 12 evenly spaced frames for MCP image responses
-            let max_images = 12usize;
+            // Sample evenly spaced frames and downscale for MCP token efficiency
             let mut sampled_b64 = Vec::new();
-            if total_captured <= max_images {
-                for f in &frames {
-                    sampled_b64.push(encode_png_base64(f)?);
-                }
+            let indices: Vec<usize> = if total_captured <= max_images {
+                (0..total_captured).collect()
+            } else if max_images == 1 {
+                vec![total_captured - 1]
             } else {
-                for i in 0..max_images {
-                    let idx = (i * (total_captured - 1)) / (max_images - 1);
-                    sampled_b64.push(encode_png_base64(&frames[idx])?);
+                (0..max_images)
+                    .map(|i| (i * (total_captured - 1)) / (max_images - 1))
+                    .collect()
+            };
+            for idx in indices {
+                let (scaled, scale) =
+                    downscale_for_mcp(frames[idx].clone(), this.config.max_image_width)?;
+                if let Ok(mut scales) = this.coord_scales.lock() {
+                    scales.insert(info.id, scale);
                 }
+                sampled_b64.push(encode_png_base64(&scaled)?);
             }
 
             Ok((info, sampled_b64, gif_path.display().to_string(), total_captured))
@@ -242,23 +274,30 @@ impl RustSightServer {
     )]
     async fn click(&self, Parameters(params): Parameters<ClickParams>) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let include = params.include_screenshot.unwrap_or(true);
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
             let info = this.resolve_window(params.window_id)?;
+            let (sx, sy) = this.scale_coords(info.id, params.x, params.y);
             let btn = MouseButton::parse(params.button.as_deref().unwrap_or("left"))?;
-            this.input
-                .click(&info, params.x, params.y, btn, params.double)?;
-            this.settle_and_capture(info.id)
+            this.input.click(&info, sx, sy, btn, params.double)?;
+            if include {
+                let (info, b64) = this.settle_and_capture(info.id)?;
+                Ok((info, Some(b64)))
+            } else {
+                Ok((info, None))
+            }
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
-                format!(
-                    "Clicked ({}, {}) on `{}` (window_id={})",
-                    params.x, params.y, info.title, info.id
-                ),
+            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+                format!("Clicked ({}, {}) on `{}`", params.x, params.y, info.title),
                 b64,
             ),
+            Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Clicked ({}, {}) on `{}`",
+                params.x, params.y, info.title
+            ))]),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
         }
@@ -267,26 +306,32 @@ impl RustSightServer {
     /// Type text into the focused window and return a fresh screenshot.
     #[tool(
         name = "type_text",
-        description = "Type a text string into the target window (focuses the window first). Waits for the UI to settle and returns a fresh PNG screenshot."
+        description = "Type a text string into the target window (focuses the window first). Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
     )]
     async fn type_text(&self, Parameters(params): Parameters<TypeTextParams>) -> CallToolResult {
         let this = self.clone();
+        let include = params.include_screenshot.unwrap_or(true);
         let text_len = params.text.chars().count();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
             let info = this.resolve_window(params.window_id)?;
             this.input.type_text(&info, &params.text)?;
-            this.settle_and_capture(info.id)
+            if include {
+                let (info, b64) = this.settle_and_capture(info.id)?;
+                Ok((info, Some(b64)))
+            } else {
+                Ok((info, None))
+            }
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
-                format!(
-                    "Typed {text_len} characters into `{}` (window_id={})",
-                    info.title, info.id
-                ),
-                b64,
-            ),
+            Ok(Ok((info, Some(b64)))) => {
+                Self::ok_with_screenshot(format!("Typed {text_len} chars into `{}`", info.title), b64)
+            }
+            Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Typed {text_len} chars into `{}`",
+                info.title
+            ))]),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
         }
@@ -295,28 +340,35 @@ impl RustSightServer {
     /// Press a key with optional modifiers and return a fresh screenshot.
     #[tool(
         name = "press_key",
-        description = "Press a keyboard key with optional modifiers (ctrl, alt, shift, win). Waits for the UI to settle and returns a fresh PNG screenshot."
+        description = "Press a keyboard key with optional modifiers (ctrl, alt, shift, win). Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
     )]
     async fn press_key(&self, Parameters(params): Parameters<PressKeyParams>) -> CallToolResult {
         let this = self.clone();
+        let include = params.include_screenshot.unwrap_or(true);
         let key_desc = params.key.clone();
         let mods_desc = params.modifiers.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
             let info = this.resolve_window(params.window_id)?;
             let mods = Modifiers::from_list(&params.modifiers);
             this.input.press_key(&info, &params.key, &mods)?;
-            this.settle_and_capture(info.id)
+            if include {
+                let (info, b64) = this.settle_and_capture(info.id)?;
+                Ok((info, Some(b64)))
+            } else {
+                Ok((info, None))
+            }
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
-                format!(
-                    "Pressed key `{key_desc}` (modifiers={mods_desc:?}) on `{}` (window_id={})",
-                    info.title, info.id
-                ),
+            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+                format!("Pressed `{key_desc}` (mods={mods_desc:?}) on `{}`", info.title),
                 b64,
             ),
+            Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}`",
+                info.title
+            ))]),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
         }
@@ -325,26 +377,33 @@ impl RustSightServer {
     /// Scroll at window-relative coordinates (x, y) and return a fresh screenshot.
     #[tool(
         name = "scroll",
-        description = "Scroll at (x, y) in screenshot coordinates. Positive dy scrolls down, negative dy scrolls up. Waits for the UI to settle and returns a fresh PNG screenshot."
+        description = "Scroll at (x, y) in screenshot coordinates. Positive dy scrolls down, negative dy scrolls up. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
     )]
     async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let include = params.include_screenshot.unwrap_or(true);
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
             let info = this.resolve_window(params.window_id)?;
-            this.input
-                .scroll(&info, params.x, params.y, params.dx, params.dy)?;
-            this.settle_and_capture(info.id)
+            let (sx, sy) = this.scale_coords(info.id, params.x, params.y);
+            this.input.scroll(&info, sx, sy, params.dx, params.dy)?;
+            if include {
+                let (info, b64) = this.settle_and_capture(info.id)?;
+                Ok((info, Some(b64)))
+            } else {
+                Ok((info, None))
+            }
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
-                format!(
-                    "Scrolled (dx={}, dy={}) at ({}, {}) on `{}` (window_id={})",
-                    params.dx, params.dy, params.x, params.y, info.title, info.id
-                ),
+            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+                format!("Scrolled ({}, {}) at ({}, {}) on `{}`", params.dx, params.dy, params.x, params.y, info.title),
                 b64,
             ),
+            Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Scrolled ({}, {}) at ({}, {}) on `{}`",
+                params.dx, params.dy, params.x, params.y, info.title
+            ))]),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
         }
@@ -353,31 +412,34 @@ impl RustSightServer {
     /// Drag from (from_x, from_y) to (to_x, to_y) in window-relative coordinates and return a fresh screenshot.
     #[tool(
         name = "drag",
-        description = "Press left mouse button at (from_x, from_y), drag smoothly to (to_x, to_y), and release. Waits for the UI to settle and returns a fresh PNG screenshot."
+        description = "Press left mouse button at (from_x, from_y), drag smoothly to (to_x, to_y), and release. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let include = params.include_screenshot.unwrap_or(true);
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
             let info = this.resolve_window(params.window_id)?;
-            this.input.drag(
-                &info,
-                params.from_x,
-                params.from_y,
-                params.to_x,
-                params.to_y,
-            )?;
-            this.settle_and_capture(info.id)
+            let (fx, fy) = this.scale_coords(info.id, params.from_x, params.from_y);
+            let (tx, ty) = this.scale_coords(info.id, params.to_x, params.to_y);
+            this.input.drag(&info, fx, fy, tx, ty)?;
+            if include {
+                let (info, b64) = this.settle_and_capture(info.id)?;
+                Ok((info, Some(b64)))
+            } else {
+                Ok((info, None))
+            }
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
-                format!(
-                    "Dragged ({}, {}) -> ({}, {}) on `{}` (window_id={})",
-                    params.from_x, params.from_y, params.to_x, params.to_y, info.title, info.id
-                ),
+            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+                format!("Dragged ({}, {}) -> ({}, {}) on `{}`", params.from_x, params.from_y, params.to_x, params.to_y, info.title),
                 b64,
             ),
+            Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Dragged ({}, {}) -> ({}, {}) on `{}`",
+                params.from_x, params.from_y, params.to_x, params.to_y, info.title
+            ))]),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
         }
@@ -401,7 +463,12 @@ impl RustSightServer {
                 std::thread::sleep(Duration::from_millis(120));
                 let curr = this.capture.capture_window(info.id)?;
                 if !frames_differ(&prev, &curr, 0.001) {
-                    let b64 = encode_png_base64(&curr)?;
+                    let (scaled, scale) =
+                        downscale_for_mcp(curr, this.config.max_image_width)?;
+                    if let Ok(mut scales) = this.coord_scales.lock() {
+                        scales.insert(info.id, scale);
+                    }
+                    let b64 = encode_png_base64(&scaled)?;
                     return Ok((info, b64, start.elapsed().as_millis()));
                 }
                 if Instant::now() >= deadline {
@@ -440,8 +507,7 @@ impl RustSightServer {
                 })?;
                 pm.rebuild(this.capture.as_ref().as_ref(), timeout)?
             };
-            let frame = this.capture.capture_window(info.id)?;
-            let b64 = encode_png_base64(&frame)?;
+            let b64 = this.capture_and_encode(info.id)?;
             Ok((info, b64))
         })
         .await;

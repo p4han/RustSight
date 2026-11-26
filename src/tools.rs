@@ -25,10 +25,12 @@ pub struct WindowIdParams {
 pub struct CaptureFramesParams {
     /// Target window ID. Defaults to the currently active launched window.
     pub window_id: Option<WindowId>,
-    /// Total capture duration in milliseconds (default: 1500, max: 10000).
+    /// Total capture duration in milliseconds (default: 1200, max: 10000).
     pub duration_ms: Option<u64>,
-    /// Target capture frame rate in frames per second (default: 10, max: 30).
+    /// Target capture frame rate in frames per second (default: 8, max: 30).
     pub fps: Option<u32>,
+    /// Maximum number of evenly spaced PNG frames to return in chat (default: 5, max: 12).
+    pub max_frames: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -44,6 +46,8 @@ pub struct ClickParams {
     pub double: bool,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after clicking (default: true). Set false to save tokens during multi-step sequences.
+    pub include_screenshot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -52,6 +56,8 @@ pub struct TypeTextParams {
     pub text: String,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after typing (default: true).
+    pub include_screenshot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -63,6 +69,8 @@ pub struct PressKeyParams {
     pub modifiers: Vec<String>,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after pressing the key (default: true).
+    pub include_screenshot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -79,6 +87,8 @@ pub struct ScrollParams {
     pub dy: i32,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after scrolling (default: true).
+    pub include_screenshot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,6 +103,8 @@ pub struct DragParams {
     pub to_y: i32,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after dragging (default: true).
+    pub include_screenshot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
