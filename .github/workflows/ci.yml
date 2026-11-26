@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build rustsight
+        run: cargo build --release
+      - name: Run tests
+        run: cargo test
+      - name: Build demo_egui example
+        run: cargo build --manifest-path examples/demo_egui/Cargo.toml
