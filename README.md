@@ -16,11 +16,7 @@
 cargo install --git https://github.com/p4han/RustSight
 ```
 
-This installs the `rustsight` binary onto your Cargo `PATH` (`%USERPROFILE%\.cargo\bin\rustsight.exe`).
-
-## Download
-
-Prefer a prebuilt binary? Download `rustsight.exe` (or `rustsight-windows-x64.zip`) from the [GitHub Releases](https://github.com/p4han/RustSight/releases) page and place it somewhere on your `PATH`.
+This installs the `rustsight` MCP server binary onto your Cargo `PATH` (`%USERPROFILE%\.cargo\bin\rustsight.exe`).
 
 ## Demo
 
@@ -97,26 +93,6 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 - `--default-width <PX>` / `--default-height <PX>` — Default window size on `launch`.
 - `--build-timeout-secs <SECS>` (default: `300`) — Timeout for `cargo build`.
 - `--log-level <LEVEL>` (default: `info`) — Tracing log level (written to `stderr`).
-
-## Building from Source
-
-Requires Rust 1.88+ on Windows:
-
-```powershell
-git clone https://github.com/p4han/RustSight.git
-cd RustSight
-cargo build --release
-```
-
-The binary will be at `target\release\rustsight.exe`.
-
-## Demo App
-
-An `egui` demo app is included in [`examples/demo_egui`](examples/demo_egui) with buttons, a text input box, an animated bouncing circle, and a scrollable list:
-
-```powershell
-cargo run --manifest-path examples/demo_egui/Cargo.toml
-```
 
 ## Architecture
 
