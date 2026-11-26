@@ -21,7 +21,7 @@ Your agent will follow [SKILL.md](SKILL.md) to install the `rustsight` binary an
 Or install manually with Cargo:
 
 ```powershell
-cargo install --git https://github.com/p4han/RustSight
+cargo install --git https://github.com/p4han/RustSight rustsight
 ```
 
 This installs the `rustsight` MCP server binary onto your Cargo `PATH` (`%USERPROFILE%\.cargo\bin\rustsight.exe`).

@@ -13,7 +13,7 @@ When the user points you to `https://github.com/p4han/RustSight` and asks you to
 
 1. **Install the `rustsight` binary** via Cargo:
    ```powershell
-   cargo install --git https://github.com/p4han/RustSight
+   cargo install --git https://github.com/p4han/RustSight rustsight
    ```
    Verify it is on `PATH`:
    ```powershell
