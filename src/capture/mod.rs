@@ -12,6 +12,9 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
+#[cfg(not(windows))]
+use crate::backend::{WindowId, WindowInfo};
+
 pub fn create_capture_backend() -> Box<dyn WindowCaptureBackend> {
     #[cfg(windows)]
     {
@@ -19,9 +22,52 @@ pub fn create_capture_backend() -> Box<dyn WindowCaptureBackend> {
     }
     #[cfg(not(windows))]
     {
-        compile_error!(
-            "Only Windows is currently supported; macOS/Linux backends can be added behind WindowCaptureBackend."
-        )
+        Box::new(StubCaptureBackend)
+    }
+}
+
+#[cfg(not(windows))]
+struct StubCaptureBackend;
+
+#[cfg(not(windows))]
+impl WindowCaptureBackend for StubCaptureBackend {
+    fn init(&self) -> Result<()> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
+    }
+    fn find_window_by_pid(&self, _pid: u32) -> Result<Option<WindowInfo>> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
+    }
+    fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
+    }
+    fn get_window_info(&self, _window_id: WindowId) -> Result<WindowInfo> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
+    }
+    fn is_window_alive(&self, _window_id: WindowId) -> bool {
+        false
+    }
+    fn capture_window(&self, _window_id: WindowId) -> Result<CapturedFrame> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
+    }
+    fn resize_window(&self, _window_id: WindowId, _width: u32, _height: u32) -> Result<()> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
+    }
+    fn focus_window(&self, _window_id: WindowId) -> Result<()> {
+        Err(RustSightError::CaptureFailed(
+            "RustSight currently supports Windows only".into(),
+        ))
     }
 }
 

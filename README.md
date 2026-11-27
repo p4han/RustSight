@@ -79,19 +79,20 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 | Tool | Description |
 | --- | --- |
 | `launch(path_or_cargo_dir, args?, width?, height?, bin?, package?, release?, features?, all_features?)` | Build (if Cargo project) and launch the app, returning `window_id` + first screenshot. |
-| `screenshot(window_id?)` | Capture a PNG screenshot of the window. |
-| `capture_frames(window_id?, duration_ms=1500, fps=10)` | Burst-capture frames, returning up to 12 PNGs + an animated GIF path on disk. |
+| `list_windows()` | List visible top-level GUI windows allowed by the active attach policy (`--allow-attach` / `--allow-process`). |
+| `screenshot(window_id?, region?)` | Capture a PNG screenshot of the window (optionally cropped to `region` `{x, y, width, height}`). |
+| `capture_frames(window_id?, duration_ms=1200, fps=8, max_frames=3)` | Burst-capture frames, returning up to 12 PNGs + an animated GIF path on disk. |
 | `get_ui_tree(window_id?, max_depth?, max_nodes?, include_offscreen?, include_screenshot?)` | Inspect the Windows UI Automation tree with element IDs, roles, names, flags, and screenshot-space centers. |
 | `find_element(name?, role?, automation_id?, window_id?, max_results?)` | Search the UI Automation tree (case-insensitive substring on `name`, exact `role` / `automation_id`). |
-| `click_element(name?, role?, automation_id?, index?, button?, double?, window_id?)` | Find a UI Automation element and click its center (requires `index` when multiple match). |
-| `click(x, y, button?, double?, window_id?)` | Click at window-relative pixel `(x, y)` and return a fresh screenshot. |
+| `click_element(name?, role?, automation_id?, index?, button?, double?, window_id?, include_screenshot?)` | Find a UI Automation element and click its center (requires `index` when multiple match). |
+| `click(x, y, button?, double?, window_id?, include_screenshot?)` | Click at window-relative pixel `(x, y)` and return a fresh screenshot. |
 | `hover(x, y, window_id?, include_screenshot?)` | Move the mouse cursor to `(x, y)` without clicking and return a fresh screenshot. |
 | `focus(window_id?)` | Bring the window to the foreground using verified focus logic and return a screenshot. |
 | `resize_window(width, height, window_id?)` | Resize the window (`100` to `8000` px) and return the new size + screenshot. |
-| `type_text(text, window_id?)` | Type Unicode text into the window and return a fresh screenshot. |
-| `press_key(key, modifiers?, window_id?)` | Press a key with optional modifiers (`ctrl`, `alt`, `shift`, `win`) and return a fresh screenshot. |
-| `scroll(x, y, dx?, dy?, window_id?)` | Scroll at `(x, y)` and return a fresh screenshot. |
-| `drag(from_x, from_y, to_x, to_y, window_id?)` | Drag from `(from_x, from_y)` to `(to_x, to_y)` and return a fresh screenshot. |
+| `type_text(text, window_id?, include_screenshot?)` | Type Unicode text into the window and return a fresh screenshot. |
+| `press_key(key, modifiers?, window_id?, include_screenshot?)` | Press a key with optional modifiers (`ctrl`, `alt`, `shift`, `win`) and return a fresh screenshot. |
+| `scroll(x, y, dx?, dy?, window_id?, include_screenshot?)` | Scroll at `(x, y)` and return a fresh screenshot. |
+| `drag(from_x, from_y, to_x, to_y, window_id?, include_screenshot?)` | Drag from `(from_x, from_y)` to `(to_x, to_y)` and return a fresh screenshot. |
 | `wait_idle(timeout_ms?, threshold?, window_id?)` | Wait until consecutive frames stop changing, then return a fresh screenshot. |
 | `get_logs(window_id?, tail?, clear?)` | Read recent stdout/stderr log lines captured from a launched app (default last 200 lines). |
 | `rebuild()` | Kill the current app, run `cargo build`, relaunch, and return a fresh screenshot. |
@@ -129,8 +130,17 @@ RustSight inspects native Windows UI Automation trees (`IUIAutomation`) and conv
 - `src/backend.rs` — Platform-agnostic `WindowCaptureBackend` and `InputBackend` traits (ready for macOS/Linux backends).
 - `src/capture/` — Windows Graphics Capture API (with cached D3D11/WinRT devices, reusable staging textures, and persistent burst capture sessions) + `PrintWindow` fallback, PNG/GIF encoding, and frame diffing.
 - `src/input/` — DPI-aware `SendInput` mouse, keyboard, scroll, and drag injection with `PostMessageW` fallback.
-- `src/process/` — Cargo builder (`--message-format=json`), executable discovery, Windows Job Object lifecycle cleanup.
+- `src/process/` — Cargo builder (`--message-format=json`), executable discovery, per-process log ring buffer, Windows Job Object lifecycle cleanup.
+- `src/ui_tree/` — Windows UI Automation (`IUIAutomation`) tree inspection, screenshot-space coordinate mapping, and password masking.
 - `src/server.rs` & `src/tools.rs` — `rmcp` stdio MCP server and tool schemas.
+
+### Running Desktop Integration Tests
+
+Tests that require a live Windows desktop session are marked `#[ignore]`. To run them locally:
+
+```powershell
+cargo test -- --ignored
+```
 
 ## Troubleshooting
 

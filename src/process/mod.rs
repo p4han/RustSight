@@ -954,4 +954,14 @@ mod tests {
         assert_eq!(cleared.len(), 2);
         assert!(buf.take_tail(10, false).is_empty());
     }
+
+    #[test]
+    fn detect_cargo_manifest_finds_dir_and_file() {
+        let cwd = std::env::current_dir().unwrap();
+        let from_dir = detect_cargo_manifest(&cwd).expect("manifest from dir");
+        assert!(from_dir.ends_with("Cargo.toml"));
+        let from_file = detect_cargo_manifest(&from_dir).expect("manifest from file");
+        assert_eq!(from_dir, from_file);
+        assert!(detect_cargo_manifest(Path::new("nonexistent_dir_xyz")).is_none());
+    }
 }

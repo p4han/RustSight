@@ -61,3 +61,43 @@ impl Config {
             .unwrap_or_else(|| std::env::temp_dir().join("rustsight_captures"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_and_cli_parsing() {
+        let def = Config::try_parse_from(["rustsight"]).expect("default config");
+        assert_eq!(def.settle_ms, 120);
+        assert_eq!(def.settle_max_ms, 1000);
+        assert_eq!(def.build_timeout_secs, 300);
+        assert_eq!(def.window_timeout_secs, 15);
+        assert_eq!(def.max_image_width, 1920);
+        assert_eq!(def.default_max_frames, 3);
+        assert_eq!(def.log_level, "info");
+        assert!(!def.allow_attach);
+        assert!(def.allow_process.is_empty());
+
+        let parsed = Config::try_parse_from([
+            "rustsight",
+            "--settle-ms",
+            "50",
+            "--settle-max-ms",
+            "800",
+            "--max-image-width",
+            "0",
+            "--allow-attach",
+            "--allow-process",
+            "notepad.exe",
+            "--allow-process",
+            "calc.exe",
+        ])
+        .expect("parsed config");
+        assert_eq!(parsed.settle_ms, 50);
+        assert_eq!(parsed.settle_max_ms, 800);
+        assert_eq!(parsed.max_image_width, 0);
+        assert!(parsed.allow_attach);
+        assert_eq!(parsed.allow_process, vec!["notepad.exe", "calc.exe"]);
+    }
+}

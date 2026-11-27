@@ -1691,4 +1691,68 @@ mod tests {
         assert!(super::validate_resize_dims(100, 100).is_ok());
         assert!(super::validate_resize_dims(1920, 1080).is_ok());
     }
+
+    #[test]
+    fn router_registers_all_expected_tools() {
+        let router = super::RustSightServer::tool_router();
+        let names: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for expected in [
+            "launch",
+            "list_windows",
+            "screenshot",
+            "capture_frames",
+            "get_ui_tree",
+            "find_element",
+            "click_element",
+            "click",
+            "hover",
+            "focus",
+            "resize_window",
+            "type_text",
+            "press_key",
+            "scroll",
+            "drag",
+            "wait_idle",
+            "get_logs",
+            "rebuild",
+            "close",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing tool `{expected}` in router: {names:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Requires a live Windows desktop session; run with `cargo test -- --ignored`"]
+    fn desktop_integration_launch_screenshot_click_and_close_demo_egui() {
+        let capture = crate::capture::create_capture_backend();
+        capture.init().expect("init capture");
+        let input = crate::input::create_input_backend();
+        let spec = crate::process::LaunchSpec {
+            path_or_cargo_dir: "examples/demo_egui".to_string(),
+            ..Default::default()
+        };
+        let prepared = crate::process::prepare_launch(
+            spec,
+            capture.as_ref(),
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(15),
+        )
+        .expect("launch demo_egui");
+        let mut pm = crate::process::ProcessManager::new();
+        let info = pm.register_launched(prepared);
+        let frame = capture.capture_window(info.id).expect("screenshot");
+        assert!(frame.width > 0 && frame.height > 0);
+        input
+            .click(&info, 50, 50, crate::backend::MouseButton::Left, false)
+            .expect("click");
+        pm.close(Some(info.id)).expect("close");
+    }
 }

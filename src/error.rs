@@ -61,3 +61,46 @@ pub enum RustSightError {
 }
 
 pub type Result<T> = std::result::Result<T, RustSightError>;
+
+#[cfg(test)]
+mod tests {
+    use super::RustSightError;
+
+    #[test]
+    fn error_messages_are_clear_and_actionable() {
+        assert!(
+            RustSightError::NoActiveWindow
+                .to_string()
+                .contains("launch")
+        );
+        assert!(
+            RustSightError::WindowNotFound(42)
+                .to_string()
+                .contains("42")
+        );
+        assert!(
+            RustSightError::WindowNotAllowed {
+                window_id: 7,
+                pid: 99,
+                title: "Secret".into(),
+            }
+            .to_string()
+            .contains("--allow-attach")
+        );
+        assert!(
+            RustSightError::FocusFailed("blocked".into())
+                .to_string()
+                .contains("blocked")
+        );
+        assert!(
+            RustSightError::InvalidKey("badkey".into())
+                .to_string()
+                .contains("badkey")
+        );
+        assert!(
+            RustSightError::NothingToRebuild
+                .to_string()
+                .contains("launch")
+        );
+    }
+}

@@ -6,16 +6,39 @@ on:
   pull_request:
     branches: [ main, master ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build rustsight
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build rustsight (release)
         run: cargo build --release
       - name: Run tests
         run: cargo test
       - name: Build demo_egui example
         run: cargo build --manifest-path examples/demo_egui/Cargo.toml
+
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify SKILL.md files are identical
+        run: diff -u SKILL.md skills/rustsight/SKILL.md
+      - name: Check Linux stub build
+        run: cargo check
+      - name: Run Linux stub tests
+        run: cargo test

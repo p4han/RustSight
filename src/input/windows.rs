@@ -844,4 +844,18 @@ mod tests {
         assert!(matches!(res, Err(RustSightError::FocusFailed(_))));
         assert!(!called, "fallback must not run for invalid HWND");
     }
+
+    #[test]
+    fn parse_virtual_key_handles_common_keys_and_invalid() {
+        assert_eq!(parse_virtual_key("enter").unwrap(), VK_RETURN);
+        assert_eq!(parse_virtual_key("ESC").unwrap(), VK_ESCAPE);
+        assert_eq!(parse_virtual_key("a").unwrap(), VK_A);
+        assert_eq!(parse_virtual_key("9").unwrap(), VK_9);
+        assert_eq!(parse_virtual_key("f12").unwrap(), VK_F12);
+        assert_eq!(parse_virtual_key("/").unwrap(), VK_OEM_2);
+        assert!(matches!(
+            parse_virtual_key("nonexistent_key"),
+            Err(RustSightError::InvalidKey(_))
+        ));
+    }
 }

@@ -17,12 +17,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release
-      - name: Package zip archive
+      - name: Package zip archive and SHA256 checksums
         shell: pwsh
-        run: Compress-Archive -Path target/release/rustsight.exe -DestinationPath rustsight-windows-x64.zip -Force
+        run: |
+          Compress-Archive -Path target/release/rustsight.exe, README.md, LICENSE -DestinationPath rustsight-windows-x64.zip -Force
+          $exeHash = (Get-FileHash target/release/rustsight.exe -Algorithm SHA256).Hash.ToLower()
+          $zipHash = (Get-FileHash rustsight-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          "$exeHash  rustsight.exe`n$zipHash  rustsight-windows-x64.zip" | Set-Content -Path SHA256SUMS.txt -Encoding ascii
       - name: Upload GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/rustsight.exe
             rustsight-windows-x64.zip
+            SHA256SUMS.txt

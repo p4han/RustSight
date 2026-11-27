@@ -305,4 +305,29 @@ mod tests {
         assert!(!frames.is_empty());
         assert!(elapsed >= Duration::from_millis(90));
     }
+
+    #[test]
+    fn mouse_button_parse_handles_aliases_and_invalid() {
+        assert_eq!(MouseButton::parse("left").unwrap(), MouseButton::Left);
+        assert_eq!(MouseButton::parse("L").unwrap(), MouseButton::Left);
+        assert_eq!(MouseButton::parse("").unwrap(), MouseButton::Left);
+        assert_eq!(MouseButton::parse(" right ").unwrap(), MouseButton::Right);
+        assert_eq!(MouseButton::parse("m").unwrap(), MouseButton::Middle);
+        assert!(MouseButton::parse("side").is_err());
+    }
+
+    #[test]
+    fn modifiers_from_list_parses_all_aliases() {
+        let mods = Modifiers::from_list(&[
+            "ctrl".into(),
+            "Option".into(),
+            "SHIFT".into(),
+            "cmd".into(),
+            "unknown".into(),
+        ]);
+        assert!(mods.ctrl);
+        assert!(mods.alt);
+        assert!(mods.shift);
+        assert!(mods.meta);
+    }
 }
