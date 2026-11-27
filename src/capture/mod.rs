@@ -56,13 +56,38 @@ pub fn crop_frame(
     })
 }
 
+/// Compute the coordinate scale factor (physical capture pixels per returned MCP image pixel).
+/// Returns `1.0` when no downscaling is needed (`max_image_width == 0` or `capture_width <= max_image_width`).
+pub fn coord_scale(capture_width: u32, max_image_width: u32) -> f64 {
+    if max_image_width == 0 || capture_width == 0 || capture_width <= max_image_width {
+        1.0
+    } else {
+        capture_width as f64 / max_image_width as f64
+    }
+}
+
+/// Convert coordinates `(x, y)` in the downscaled full-window MCP screenshot space
+/// to physical client-area pixels.
+pub fn image_to_physical_coords(
+    x: i32,
+    y: i32,
+    capture_width: u32,
+    max_image_width: u32,
+) -> (i32, i32) {
+    let scale = coord_scale(capture_width, max_image_width);
+    (
+        (x as f64 * scale).round() as i32,
+        (y as f64 * scale).round() as i32,
+    )
+}
+
 /// Downscale a frame with Lanczos3 if `max_width > 0 && frame.width > max_width`.
 /// Returns `(scaled_frame, coord_scale)` where `coord_scale = orig_width / new_width`.
 pub fn downscale_for_mcp(frame: CapturedFrame, max_width: u32) -> Result<(CapturedFrame, f64)> {
-    if max_width == 0 || frame.width <= max_width || frame.width == 0 || frame.height == 0 {
+    let scale = coord_scale(frame.width, max_width);
+    if scale == 1.0 || frame.height == 0 {
         return Ok((frame, 1.0));
     }
-    let scale = frame.width as f64 / max_width as f64;
     let new_w = max_width;
     let new_h = ((frame.height as f64) / scale).round().max(1.0) as u32;
     let src = RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
@@ -195,5 +220,75 @@ mod tests {
 
         let png = encode_png(&a).expect("png encode");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn coord_scale_handles_no_downscale_exact_odd_and_zero() {
+        assert_eq!(coord_scale(1280, 1920), 1.0);
+        assert_eq!(coord_scale(1920, 1920), 1.0);
+        assert_eq!(coord_scale(3840, 1920), 2.0);
+        assert!((coord_scale(2561, 1920) - (2561.0 / 1920.0)).abs() < 1e-12);
+        assert_eq!(coord_scale(3840, 0), 1.0);
+        assert_eq!(coord_scale(0, 1920), 1.0);
+    }
+
+    #[test]
+    fn downscale_for_mcp_dimensions_and_scale() {
+        let frame = CapturedFrame {
+            width: 3840,
+            height: 2160,
+            rgba: vec![42u8; 3840 * 2160 * 4],
+        };
+        let (scaled, scale) = downscale_for_mcp(frame, 1920).expect("downscale");
+        assert_eq!(scaled.width, 1920);
+        assert_eq!(scaled.height, 1080);
+        assert_eq!(scale, 2.0);
+
+        let small = CapturedFrame {
+            width: 800,
+            height: 600,
+            rgba: vec![10u8; 800 * 600 * 4],
+        };
+        let (unchanged, scale_small) = downscale_for_mcp(small, 1920).expect("no downscale");
+        assert_eq!(unchanged.width, 800);
+        assert_eq!(unchanged.height, 600);
+        assert_eq!(scale_small, 1.0);
+    }
+
+    #[test]
+    fn crop_frame_inside_clamped_and_zero_size() {
+        let frame = CapturedFrame {
+            width: 100,
+            height: 80,
+            rgba: vec![7u8; 100 * 80 * 4],
+        };
+        let inside = crop_frame(&frame, 10, 20, 30, 40).expect("inside crop");
+        assert_eq!((inside.width, inside.height), (30, 40));
+
+        let clamped = crop_frame(&frame, 90, 70, 50, 50).expect("clamped crop");
+        assert_eq!((clamped.width, clamped.height), (10, 10));
+
+        let empty = CapturedFrame {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        };
+        assert!(crop_frame(&empty, 0, 0, 10, 10).is_err());
+    }
+
+    #[test]
+    fn image_to_physical_coords_round_trips_within_one_pixel() {
+        for (capture_w, max_w) in [(1920, 1920), (3840, 1920), (2561, 1920), (3840, 0)] {
+            let scale = coord_scale(capture_w, max_w);
+            let img_w = if scale == 1.0 { capture_w } else { max_w };
+            for x in [0, 1, img_w as i32 / 3, img_w as i32 / 2, img_w as i32 - 1] {
+                let (px, _) = image_to_physical_coords(x, 10, capture_w, max_w);
+                let back_x = (px as f64 / scale).round() as i32;
+                assert!(
+                    (back_x - x).abs() <= 1,
+                    "capture_w={capture_w}, max_w={max_w}, x={x}, px={px}, back_x={back_x}"
+                );
+            }
+        }
     }
 }

@@ -69,7 +69,7 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 ## Features
 
 - **Framework-agnostic**: Works with `egui`, `iced`, `Dioxus` desktop, `Tauri`, `Slint`, or any native Windows GUI window — no app-side instrumentation required.
-- **Covers & DPI-aware**: Uses the Windows Graphics Capture API (with `PrintWindow` fallback) so windows are captured cleanly even when partially covered, with per-monitor DPI scaling mapped 1:1 to input coordinates.
+- **Covers & DPI-aware**: Uses the Windows Graphics Capture API (with `PrintWindow` fallback) so windows are captured cleanly even when partially covered. Input coordinates use the pixels of the most recent full-window screenshot returned to the agent and map consistently to the window's client-area origin across DPI scales (downscaling above `--max-image-width` is scaled back automatically; pass `--max-image-width 0` for 1:1 physical pixels).
 - **Visual feedback loop**: Every action (`click`, `type_text`, `press_key`, `scroll`, `drag`) waits for the UI to settle and automatically returns a fresh PNG screenshot.
 - **Animation inspection**: `capture_frames` burst-captures frames, returns up to 12 evenly spaced PNGs in chat, and saves an animated GIF to disk.
 - **Fast edit-compile-preview loop**: `launch` and `rebuild` run `cargo build`, return full `rustc` compiler diagnostics on failure, and automatically clean up child processes on exit.
@@ -121,7 +121,7 @@ By default, RustSight restricts all vision and input tools (`list_windows`, `scr
 - **Clicks or keystrokes not landing**: RustSight tries OS-level `SendInput` first. If `SendInput` is blocked by Windows UIPI (e.g., an elevated window is focused or the desktop is locked/disconnected), it falls back to `PostMessageW` directly to the target `HWND`. Ensure the target app is not running elevated (as Administrator) unless `rustsight` is also elevated, and that coordinates are relative to the captured screenshot.
 - **Window focus failures**: Before sending `SendInput`, RustSight verifies with `GetForegroundWindow()` that the target window (or its root/owner) is actually in front, retrying with `AttachThreadInput` and a brief `Alt` tap if Windows refuses `SetForegroundWindow`. If focus still cannot be acquired (e.g., an elevated window holds focus or the desktop is locked), `SendInput` is skipped so input never leaks into your editor or terminal—RustSight either uses the `PostMessageW` fallback or returns a `FocusFailed` error.
 - **Build failures on `launch` or `rebuild`**: If `cargo build` fails, RustSight returns the full `rustc` stderr diagnostics directly to the agent as an actionable error message so the agent can fix the code and call `rebuild()` again.
-- **DPI scaling**: RustSight enables per-monitor DPI awareness (`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`) and uses `DWMWA_EXTENDED_FRAME_BOUNDS` so screenshot pixel coordinates map 1:1 to screen coordinates across 100%, 125%, 150%, and 200% scaling displays.
+- **DPI scaling & downscaling**: RustSight enables per-monitor DPI awareness (`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`) and aligns the captured client area (`GetClientRect` + `ClientToScreen`) with input injection across 100%, 125%, 150%, and 200% scaling displays. Screenshots wider than `--max-image-width` (default `1920`) are downscaled to save tokens, and `click`/`scroll`/`drag` automatically scale screenshot coordinates back to physical client pixels (`scale = capture_width / max_image_width`). Pass `--max-image-width 0` to disable downscaling and get 1:1 physical pixels.
 
 ## License
 

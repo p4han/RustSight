@@ -23,13 +23,13 @@ pub struct WindowIdParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CropRegion {
-    /// Left X coordinate in screenshot pixels.
+    /// Left X coordinate in full-window screenshot pixels (as returned to the agent).
     pub x: u32,
-    /// Top Y coordinate in screenshot pixels.
+    /// Top Y coordinate in full-window screenshot pixels (as returned to the agent).
     pub y: u32,
-    /// Width of the region in pixels.
+    /// Width of the region in full-window screenshot pixels.
     pub width: u32,
-    /// Height of the region in pixels.
+    /// Height of the region in full-window screenshot pixels.
     pub height: u32,
 }
 
@@ -37,7 +37,7 @@ pub struct CropRegion {
 pub struct ScreenshotParams {
     /// Target window ID. Defaults to the currently active launched window.
     pub window_id: Option<WindowId>,
-    /// Optional sub-region to crop (saves tokens when inspecting a specific widget at 1:1 detail).
+    /// Optional sub-region in full-window screenshot coordinates to crop (saves tokens; input coordinates remain in full-window screenshot space).
     pub region: Option<CropRegion>,
 }
 
@@ -95,9 +95,9 @@ pub struct PressKeyParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScrollParams {
-    /// X coordinate in pixels relative to the window where the scroll occurs.
+    /// X coordinate in pixels of the most recent full-window screenshot where the scroll occurs.
     pub x: i32,
-    /// Y coordinate in pixels relative to the window where the scroll occurs.
+    /// Y coordinate in pixels of the most recent full-window screenshot where the scroll occurs.
     pub y: i32,
     /// Horizontal scroll delta (positive = right, negative = left).
     #[serde(default)]
@@ -113,13 +113,13 @@ pub struct ScrollParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DragParams {
-    /// Starting X coordinate in pixels relative to the window.
+    /// Starting X coordinate in pixels of the most recent full-window screenshot.
     pub from_x: i32,
-    /// Starting Y coordinate in pixels relative to the window.
+    /// Starting Y coordinate in pixels of the most recent full-window screenshot.
     pub from_y: i32,
-    /// Ending X coordinate in pixels relative to the window.
+    /// Ending X coordinate in pixels of the most recent full-window screenshot.
     pub to_x: i32,
-    /// Ending Y coordinate in pixels relative to the window.
+    /// Ending Y coordinate in pixels of the most recent full-window screenshot.
     pub to_y: i32,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,

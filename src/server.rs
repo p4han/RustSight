@@ -1,7 +1,10 @@
 use crate::backend::{
     CapturedFrame, InputBackend, Modifiers, MouseButton, WindowCaptureBackend, WindowId, WindowInfo,
 };
-use crate::capture::{crop_frame, downscale_for_mcp, encode_gif, encode_png_base64, frames_differ};
+use crate::capture::{
+    coord_scale, crop_frame, downscale_for_mcp, encode_gif, encode_png_base64, frames_differ,
+    image_to_physical_coords,
+};
 use crate::config::Config;
 use crate::error::{Result as AppResult, RustSightError};
 use crate::process::{LaunchSpec, ProcessManager, is_pid_or_descendant_tracked, process_exe_name};
@@ -15,7 +18,7 @@ use rmcp::model::{
     CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,9 +28,22 @@ pub struct RustSightServer {
     capture: Arc<Box<dyn WindowCaptureBackend>>,
     input: Arc<Box<dyn InputBackend>>,
     processes: Arc<Mutex<ProcessManager>>,
-    coord_scales: Arc<Mutex<HashMap<WindowId, f64>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+struct CropBox {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+struct EncodedImage {
+    base64_png: String,
+    width: u32,
+    height: u32,
+    scale: f64,
 }
 
 impl RustSightServer {
@@ -41,7 +57,6 @@ impl RustSightServer {
             capture: Arc::new(capture),
             input: Arc::new(input),
             processes: Arc::new(Mutex::new(ProcessManager::new())),
-            coord_scales: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -96,39 +111,69 @@ impl RustSightServer {
         )
     }
 
-    fn capture_and_encode(&self, wid: WindowId) -> AppResult<String> {
-        let frame = self.capture.capture_window(wid)?;
+    fn encode_frame(&self, frame: CapturedFrame) -> AppResult<EncodedImage> {
         let (scaled, scale) = downscale_for_mcp(frame, self.config.max_image_width)?;
-        if let Ok(mut scales) = self.coord_scales.lock() {
-            scales.insert(wid, scale);
-        }
-        encode_png_base64(&scaled)
+        let width = scaled.width;
+        let height = scaled.height;
+        let base64_png = encode_png_base64(&scaled)?;
+        Ok(EncodedImage {
+            base64_png,
+            width,
+            height,
+            scale,
+        })
     }
 
-    fn scale_coords(&self, wid: WindowId, x: i32, y: i32) -> (i32, i32) {
-        let scale = self
-            .coord_scales
-            .lock()
-            .ok()
-            .and_then(|s| s.get(&wid).copied())
-            .unwrap_or(1.0);
-        (
-            (x as f64 * scale).round() as i32,
-            (y as f64 * scale).round() as i32,
+    fn capture_and_encode(&self, wid: WindowId) -> AppResult<EncodedImage> {
+        let frame = self.capture.capture_window(wid)?;
+        self.encode_frame(frame)
+    }
+
+    fn resolve_image_coords(&self, info: &WindowInfo, x: i32, y: i32) -> AppResult<(i32, i32)> {
+        if info.rect.width == 0 || info.rect.height == 0 {
+            return Err(RustSightError::InputFailed(format!(
+                "Window `{}` has zero client dimensions ({}x{})",
+                info.title, info.rect.width, info.rect.height
+            )));
+        }
+        let scale = coord_scale(info.rect.width, self.config.max_image_width);
+        let img_w = if scale == 1.0 {
+            info.rect.width
+        } else {
+            self.config.max_image_width
+        };
+        let img_h = ((info.rect.height as f64) / scale).round().max(1.0) as u32;
+        if x < 0 || y < 0 || x >= img_w as i32 || y >= img_h as i32 {
+            return Err(RustSightError::InputFailed(format!(
+                "Coordinates ({x}, {y}) are outside screenshot bounds ({img_w}x{img_h} image px, scale={scale:.3}x, physical={}x{}). Expected 0 <= x < {img_w} and 0 <= y < {img_h}.",
+                info.rect.width, info.rect.height
+            )));
+        }
+        let (px, py) = image_to_physical_coords(x, y, info.rect.width, self.config.max_image_width);
+        Ok((
+            px.clamp(0, info.rect.width.saturating_sub(1) as i32),
+            py.clamp(0, info.rect.height.saturating_sub(1) as i32),
+        ))
+    }
+
+    fn settle_and_capture(&self, wid: WindowId) -> AppResult<(WindowInfo, EncodedImage)> {
+        std::thread::sleep(Duration::from_millis(self.config.settle_ms));
+        let info = self.capture.get_window_info(wid)?;
+        let img = self.capture_and_encode(wid)?;
+        Ok((info, img))
+    }
+
+    fn format_image_meta(img: &EncodedImage, info: &WindowInfo) -> String {
+        format!(
+            "image={}x{}, scale={:.3}x, dpi_scale={:.2}",
+            img.width, img.height, img.scale, info.dpi_scale
         )
     }
 
-    fn settle_and_capture(&self, wid: WindowId) -> AppResult<(WindowInfo, String)> {
-        std::thread::sleep(Duration::from_millis(self.config.settle_ms));
-        let info = self.capture.get_window_info(wid)?;
-        let b64 = self.capture_and_encode(wid)?;
-        Ok((info, b64))
-    }
-
-    fn ok_with_screenshot(summary: String, b64_png: String) -> CallToolResult {
+    fn ok_with_screenshot(summary: String, img: EncodedImage) -> CallToolResult {
         CallToolResult::success(vec![
             Content::text(summary),
-            Content::image(b64_png, "image/png"),
+            Content::image(img.base64_png, "image/png"),
         ])
     }
 
@@ -146,7 +191,7 @@ impl RustSightServer {
     )]
     async fn launch(&self, Parameters(params): Parameters<LaunchParams>) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage)> {
             let spec = LaunchSpec {
                 path_or_cargo_dir: params.path_or_cargo_dir,
                 args: params.args,
@@ -160,23 +205,21 @@ impl RustSightServer {
                 })?;
                 pm.launch(spec, this.capture.as_ref().as_ref(), timeout)?
             };
-            let b64 = this.capture_and_encode(info.id)?;
-            Ok((info, b64))
+            let img = this.capture_and_encode(info.id)?;
+            Ok((info, img))
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
+            Ok(Ok((info, img))) => Self::ok_with_screenshot(
                 format!(
-                    "Launched `{}` (pid={}, window_id={}, size={}x{}, dpi_scale={:.2})",
+                    "Launched `{}` (pid={}, window_id={}, {})",
                     info.title,
                     info.pid,
                     info.id,
-                    info.rect.width,
-                    info.rect.height,
-                    info.dpi_scale
+                    Self::format_image_meta(&img, &info)
                 ),
-                b64,
+                img,
             ),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::LaunchFailed("task".into(), e.to_string())),
@@ -237,44 +280,63 @@ impl RustSightServer {
     /// Capture a PNG screenshot of the tracked window (or specified window_id), optionally cropped to a sub-region.
     #[tool(
         name = "screenshot",
-        description = "Capture the current window client area as a PNG screenshot. Optionally pass `region` ({x, y, width, height}) to crop to a specific widget and save tokens."
+        description = "Capture the current window client area as a PNG screenshot. Optionally pass `region` ({x, y, width, height}) in full-window screenshot coordinates (pixels of the most recent full-window screenshot) to crop to a specific widget and save tokens. Input tools always use full-window screenshot coordinates."
     )]
     async fn screenshot(&self, Parameters(params): Parameters<ScreenshotParams>) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
-            let info = this.resolve_window(params.window_id)?;
-            if let Some(reg) = params.region {
-                let scale = this
-                    .coord_scales
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.get(&info.id).copied())
-                    .unwrap_or(1.0);
-                let frame = this.capture.capture_window(info.id)?;
-                let cropped = crop_frame(
-                    &frame,
-                    (reg.x as f64 * scale).round() as u32,
-                    (reg.y as f64 * scale).round() as u32,
-                    (reg.width as f64 * scale).round() as u32,
-                    (reg.height as f64 * scale).round() as u32,
-                )?;
-                let (scaled, _) = downscale_for_mcp(cropped, this.config.max_image_width)?;
-                let b64 = encode_png_base64(&scaled)?;
-                Ok((info, b64))
-            } else {
-                let b64 = this.capture_and_encode(info.id)?;
-                Ok((info, b64))
-            }
-        })
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, EncodedImage, Option<CropBox>)> {
+                let info = this.resolve_window(params.window_id)?;
+                if let Some(reg) = params.region {
+                    let frame = this.capture.capture_window(info.id)?;
+                    let full_scale = coord_scale(frame.width, this.config.max_image_width);
+                    let phys_x = (reg.x as f64 * full_scale).round() as u32;
+                    let phys_y = (reg.y as f64 * full_scale).round() as u32;
+                    let phys_w = (reg.width as f64 * full_scale).round() as u32;
+                    let phys_h = (reg.height as f64 * full_scale).round() as u32;
+                    let cropped = crop_frame(&frame, phys_x, phys_y, phys_w, phys_h)?;
+                    let actual_x = phys_x.min(frame.width.saturating_sub(1));
+                    let actual_y = phys_y.min(frame.height.saturating_sub(1));
+                    let crop_box = CropBox {
+                        x: (actual_x as f64 / full_scale).round() as u32,
+                        y: (actual_y as f64 / full_scale).round() as u32,
+                        width: (cropped.width as f64 / full_scale).round().max(1.0) as u32,
+                        height: (cropped.height as f64 / full_scale).round().max(1.0) as u32,
+                    };
+                    let img = this.encode_frame(cropped)?;
+                    Ok((info, img, Some(crop_box)))
+                } else {
+                    let img = this.capture_and_encode(info.id)?;
+                    Ok((info, img, None))
+                }
+            },
+        )
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
+            Ok(Ok((info, img, Some(crop)))) => Self::ok_with_screenshot(
                 format!(
-                    "Screenshot of `{}` (window_id={}, {}x{}, dpi_scale={:.2})",
-                    info.title, info.id, info.rect.width, info.rect.height, info.dpi_scale
+                    "Cropped screenshot of `{}` (window_id={}, {}). Crop region in full-screenshot space: origin=({}, {}), size={}x{}. Click/scroll/drag always use full-screenshot coordinates — add ({}, {}) to crop-local coordinates.",
+                    info.title,
+                    info.id,
+                    Self::format_image_meta(&img, &info),
+                    crop.x,
+                    crop.y,
+                    crop.width,
+                    crop.height,
+                    crop.x,
+                    crop.y
                 ),
-                b64,
+                img,
+            ),
+            Ok(Ok((info, img, None))) => Self::ok_with_screenshot(
+                format!(
+                    "Screenshot of `{}` (window_id={}, {})",
+                    info.title,
+                    info.id,
+                    Self::format_image_meta(&img, &info)
+                ),
+                img,
             ),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
@@ -292,7 +354,7 @@ impl RustSightServer {
     ) -> CallToolResult {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(
-            move || -> AppResult<(WindowInfo, Vec<String>, String, usize)> {
+            move || -> AppResult<(WindowInfo, Vec<EncodedImage>, String, usize)> {
                 let info = this.resolve_window(params.window_id)?;
                 let duration_ms = params.duration_ms.unwrap_or(1200).clamp(100, 10_000);
                 let fps = params.fps.unwrap_or(8).clamp(1, 30);
@@ -338,7 +400,7 @@ impl RustSightServer {
                 encode_gif(&frames, delay_ms, &gif_path)?;
 
                 // Sample evenly spaced frames and downscale for MCP token efficiency
-                let mut sampled_b64 = Vec::new();
+                let mut sampled_imgs = Vec::new();
                 let indices: Vec<usize> = if total_captured <= max_images {
                     (0..total_captured).collect()
                 } else if max_images == 1 {
@@ -349,17 +411,12 @@ impl RustSightServer {
                         .collect()
                 };
                 for idx in indices {
-                    let (scaled, scale) =
-                        downscale_for_mcp(frames[idx].clone(), this.config.max_image_width)?;
-                    if let Ok(mut scales) = this.coord_scales.lock() {
-                        scales.insert(info.id, scale);
-                    }
-                    sampled_b64.push(encode_png_base64(&scaled)?);
+                    sampled_imgs.push(this.encode_frame(frames[idx].clone())?);
                 }
 
                 Ok((
                     info,
-                    sampled_b64,
+                    sampled_imgs,
                     gif_path.display().to_string(),
                     total_captured,
                 ))
@@ -369,14 +426,18 @@ impl RustSightServer {
 
         match res {
             Ok(Ok((info, images, gif_path, total))) => {
+                let meta = images
+                    .first()
+                    .map(|img| Self::format_image_meta(img, &info))
+                    .unwrap_or_else(|| format!("dpi_scale={:.2}", info.dpi_scale));
                 let mut contents = vec![Content::text(format!(
-                    "Captured {total} frames of `{}` (window_id={}), returning {} evenly spaced frames.\nAnimated GIF saved to: {gif_path}",
+                    "Captured {total} frames of `{}` (window_id={}, {meta}), returning {} evenly spaced frames.\nAnimated GIF saved to: {gif_path}",
                     info.title,
                     info.id,
                     images.len()
                 ))];
                 for img in images {
-                    contents.push(Content::image(img, "image/png"));
+                    contents.push(Content::image(img.base64_png, "image/png"));
                 }
                 CallToolResult::success(contents)
             }
@@ -388,30 +449,37 @@ impl RustSightServer {
     /// Click at window-relative pixel coordinates (x, y) and return a fresh screenshot.
     #[tool(
         name = "click",
-        description = "Click at (x, y) in screenshot pixel coordinates relative to the top-left of the window. Supports left/right/middle button and double-click. Waits for the UI to settle and returns a fresh PNG screenshot."
+        description = "Click at (x, y) in pixels of the most recent full-window screenshot (relative to the top-left of the client area). Supports left/right/middle button and double-click. Waits for the UI to settle and returns a fresh PNG screenshot."
     )]
     async fn click(&self, Parameters(params): Parameters<ClickParams>) -> CallToolResult {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
-        let res =
-            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
                 let info = this.resolve_window(params.window_id)?;
-                let (sx, sy) = this.scale_coords(info.id, params.x, params.y);
+                let (sx, sy) = this.resolve_image_coords(&info, params.x, params.y)?;
                 let btn = MouseButton::parse(params.button.as_deref().unwrap_or("left"))?;
                 this.input.click(&info, sx, sy, btn, params.double)?;
                 if include {
-                    let (info, b64) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(b64)))
+                    let (info, img) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(img)))
                 } else {
                     Ok((info, None))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         match res {
-            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
-                format!("Clicked ({}, {}) on `{}`", params.x, params.y, info.title),
-                b64,
+            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+                format!(
+                    "Clicked ({}, {}) on `{}` ({})",
+                    params.x,
+                    params.y,
+                    info.title,
+                    Self::format_image_meta(&img, &info)
+                ),
+                img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Clicked ({}, {}) on `{}`",
@@ -431,23 +499,28 @@ impl RustSightServer {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
         let text_len = params.text.chars().count();
-        let res =
-            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
                 let info = this.resolve_window(params.window_id)?;
                 this.input.type_text(&info, &params.text)?;
                 if include {
-                    let (info, b64) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(b64)))
+                    let (info, img) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(img)))
                 } else {
                     Ok((info, None))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         match res {
-            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
-                format!("Typed {text_len} chars into `{}`", info.title),
-                b64,
+            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+                format!(
+                    "Typed {text_len} chars into `{}` ({})",
+                    info.title,
+                    Self::format_image_meta(&img, &info)
+                ),
+                img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Typed {text_len} chars into `{}`",
@@ -468,27 +541,29 @@ impl RustSightServer {
         let include = params.include_screenshot.unwrap_or(true);
         let key_desc = params.key.clone();
         let mods_desc = params.modifiers.clone();
-        let res =
-            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
                 let info = this.resolve_window(params.window_id)?;
                 let mods = Modifiers::from_list(&params.modifiers);
                 this.input.press_key(&info, &params.key, &mods)?;
                 if include {
-                    let (info, b64) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(b64)))
+                    let (info, img) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(img)))
                 } else {
                     Ok((info, None))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         match res {
-            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
                 format!(
-                    "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}`",
-                    info.title
+                    "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}` ({})",
+                    info.title,
+                    Self::format_image_meta(&img, &info)
                 ),
-                b64,
+                img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}`",
@@ -502,32 +577,38 @@ impl RustSightServer {
     /// Scroll at window-relative coordinates (x, y) and return a fresh screenshot.
     #[tool(
         name = "scroll",
-        description = "Scroll at (x, y) in screenshot coordinates. Positive dy scrolls down, negative dy scrolls up. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
+        description = "Scroll at (x, y) in pixels of the most recent full-window screenshot. Positive dy scrolls down, negative dy scrolls up. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
     )]
     async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> CallToolResult {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
-        let res =
-            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
                 let info = this.resolve_window(params.window_id)?;
-                let (sx, sy) = this.scale_coords(info.id, params.x, params.y);
+                let (sx, sy) = this.resolve_image_coords(&info, params.x, params.y)?;
                 this.input.scroll(&info, sx, sy, params.dx, params.dy)?;
                 if include {
-                    let (info, b64) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(b64)))
+                    let (info, img) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(img)))
                 } else {
                     Ok((info, None))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         match res {
-            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
                 format!(
-                    "Scrolled ({}, {}) at ({}, {}) on `{}`",
-                    params.dx, params.dy, params.x, params.y, info.title
+                    "Scrolled ({}, {}) at ({}, {}) on `{}` ({})",
+                    params.dx,
+                    params.dy,
+                    params.x,
+                    params.y,
+                    info.title,
+                    Self::format_image_meta(&img, &info)
                 ),
-                b64,
+                img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Scrolled ({}, {}) at ({}, {}) on `{}`",
@@ -541,33 +622,39 @@ impl RustSightServer {
     /// Drag from (from_x, from_y) to (to_x, to_y) in window-relative coordinates and return a fresh screenshot.
     #[tool(
         name = "drag",
-        description = "Press left mouse button at (from_x, from_y), drag smoothly to (to_x, to_y), and release. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
+        description = "Press left mouse button at (from_x, from_y) and drag smoothly to (to_x, to_y), using pixels of the most recent full-window screenshot. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> CallToolResult {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
-        let res =
-            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Option<String>)> {
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
                 let info = this.resolve_window(params.window_id)?;
-                let (fx, fy) = this.scale_coords(info.id, params.from_x, params.from_y);
-                let (tx, ty) = this.scale_coords(info.id, params.to_x, params.to_y);
+                let (fx, fy) = this.resolve_image_coords(&info, params.from_x, params.from_y)?;
+                let (tx, ty) = this.resolve_image_coords(&info, params.to_x, params.to_y)?;
                 this.input.drag(&info, fx, fy, tx, ty)?;
                 if include {
-                    let (info, b64) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(b64)))
+                    let (info, img) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(img)))
                 } else {
                     Ok((info, None))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         match res {
-            Ok(Ok((info, Some(b64)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
                 format!(
-                    "Dragged ({}, {}) -> ({}, {}) on `{}`",
-                    params.from_x, params.from_y, params.to_x, params.to_y, info.title
+                    "Dragged ({}, {}) -> ({}, {}) on `{}` ({})",
+                    params.from_x,
+                    params.from_y,
+                    params.to_x,
+                    params.to_y,
+                    info.title,
+                    Self::format_image_meta(&img, &info)
                 ),
-                b64,
+                img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Dragged ({}, {}) -> ({}, {}) on `{}`",
@@ -585,39 +672,38 @@ impl RustSightServer {
     )]
     async fn wait_idle(&self, Parameters(params): Parameters<WaitIdleParams>) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String, u128)> {
-            let info = this.resolve_window(params.window_id)?;
-            let timeout_ms = params.timeout_ms.unwrap_or(5000);
-            let start = Instant::now();
-            let deadline = start + Duration::from_millis(timeout_ms);
+        let res =
+            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage, u128)> {
+                let info = this.resolve_window(params.window_id)?;
+                let timeout_ms = params.timeout_ms.unwrap_or(5000);
+                let start = Instant::now();
+                let deadline = start + Duration::from_millis(timeout_ms);
 
-            let mut prev = this.capture.capture_window(info.id)?;
-            loop {
-                std::thread::sleep(Duration::from_millis(120));
-                let curr = this.capture.capture_window(info.id)?;
-                if !frames_differ(&prev, &curr, 0.001) {
-                    let (scaled, scale) = downscale_for_mcp(curr, this.config.max_image_width)?;
-                    if let Ok(mut scales) = this.coord_scales.lock() {
-                        scales.insert(info.id, scale);
+                let mut prev = this.capture.capture_window(info.id)?;
+                loop {
+                    std::thread::sleep(Duration::from_millis(120));
+                    let curr = this.capture.capture_window(info.id)?;
+                    if !frames_differ(&prev, &curr, 0.001) {
+                        let img = this.encode_frame(curr)?;
+                        return Ok((info, img, start.elapsed().as_millis()));
                     }
-                    let b64 = encode_png_base64(&scaled)?;
-                    return Ok((info, b64, start.elapsed().as_millis()));
+                    if Instant::now() >= deadline {
+                        return Err(RustSightError::IdleTimeout(timeout_ms));
+                    }
+                    prev = curr;
                 }
-                if Instant::now() >= deadline {
-                    return Err(RustSightError::IdleTimeout(timeout_ms));
-                }
-                prev = curr;
-            }
-        })
-        .await;
+            })
+            .await;
 
         match res {
-            Ok(Ok((info, b64, elapsed))) => Self::ok_with_screenshot(
+            Ok(Ok((info, img, elapsed))) => Self::ok_with_screenshot(
                 format!(
-                    "Window `{}` (window_id={}) settled after {elapsed} ms",
-                    info.title, info.id
+                    "Window `{}` (window_id={}) settled after {elapsed} ms ({})",
+                    info.title,
+                    info.id,
+                    Self::format_image_meta(&img, &info)
                 ),
-                b64,
+                img,
             ),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
@@ -631,7 +717,7 @@ impl RustSightServer {
     )]
     async fn rebuild(&self) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, String)> {
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage)> {
             let timeout = Duration::from_secs(this.config.build_timeout_secs);
             let info = {
                 let mut pm = this.processes.lock().map_err(|_| {
@@ -639,18 +725,21 @@ impl RustSightServer {
                 })?;
                 pm.rebuild(this.capture.as_ref().as_ref(), timeout)?
             };
-            let b64 = this.capture_and_encode(info.id)?;
-            Ok((info, b64))
+            let img = this.capture_and_encode(info.id)?;
+            Ok((info, img))
         })
         .await;
 
         match res {
-            Ok(Ok((info, b64))) => Self::ok_with_screenshot(
+            Ok(Ok((info, img))) => Self::ok_with_screenshot(
                 format!(
-                    "Rebuilt and relaunched `{}` (pid={}, window_id={}, size={}x{})",
-                    info.title, info.pid, info.id, info.rect.width, info.rect.height
+                    "Rebuilt and relaunched `{}` (pid={}, window_id={}, {})",
+                    info.title,
+                    info.pid,
+                    info.id,
+                    Self::format_image_meta(&img, &info)
                 ),
-                b64,
+                img,
             ),
             Ok(Err(e)) => Self::err_result(e),
             Err(e) => Self::err_result(RustSightError::LaunchFailed(

@@ -453,9 +453,9 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
         let tex_h = desc.Height;
         let row_pitch = mapped.RowPitch as usize;
 
-        // WGC captures the full GetWindowRect (including invisible DWM drop-shadow borders).
-        // Crop to DWMWA_EXTENDED_FRAME_BOUNDS so the image has no black/shadow border and
-        // coordinates align 1:1 with get_window_bounds().
+        // WGC captures the full GetWindowRect (including title bar and DWM drop-shadow borders).
+        // Crop to get_window_bounds() (client area) so the image has no title bar/shadow border
+        // and its top-left pixel aligns 1:1 with the client-area origin used for input.
         let mut full_rect = RECT::default();
         let (crop_x, crop_y, crop_w, crop_h) = if GetWindowRect(hwnd, &mut full_rect).is_ok() {
             if let Ok(ext) = get_window_bounds(hwnd) {
