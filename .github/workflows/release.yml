@@ -25,7 +25,7 @@ jobs:
           $zipHash = (Get-FileHash rustsight-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
           "$exeHash  rustsight.exe`n$zipHash  rustsight-windows-x64.zip" | Set-Content -Path SHA256SUMS.txt -Encoding ascii
       - name: Upload GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             target/release/rustsight.exe
