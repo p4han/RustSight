@@ -4,7 +4,7 @@ use crate::backend::{
 use crate::capture::{crop_frame, downscale_for_mcp, encode_gif, encode_png_base64, frames_differ};
 use crate::config::Config;
 use crate::error::{Result as AppResult, RustSightError};
-use crate::process::{LaunchSpec, ProcessManager};
+use crate::process::{LaunchSpec, ProcessManager, is_pid_or_descendant_tracked, process_exe_name};
 use crate::tools::{
     CaptureFramesParams, ClickParams, DragParams, LaunchParams, PressKeyParams, ScreenshotParams,
     ScrollParams, TypeTextParams, WaitIdleParams, WindowIdParams,
@@ -15,7 +15,7 @@ use rmcp::model::{
     CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,13 +53,47 @@ impl RustSightServer {
     }
 
     fn resolve_window(&self, window_id: Option<WindowId>) -> AppResult<WindowInfo> {
-        let wid = {
+        let (wid, tracked_pids) = {
             let pm = self.processes.lock().map_err(|_| {
                 RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
             })?;
-            pm.resolve_window_id(window_id)?
+            (pm.resolve_window_id(window_id)?, pm.tracked_pids())
         };
-        self.capture.get_window_info(wid)
+        let info = self.capture.get_window_info(wid)?;
+        if !self.is_window_info_allowed(&info, &tracked_pids) {
+            return Err(RustSightError::WindowNotAllowed {
+                window_id: info.id,
+                pid: info.pid,
+                title: info.title,
+            });
+        }
+        Ok(info)
+    }
+
+    fn is_window_info_allowed(&self, info: &WindowInfo, tracked_pids: &HashSet<u32>) -> bool {
+        if is_pid_or_descendant_tracked(info.pid, tracked_pids) {
+            return true;
+        }
+        if self.config.allow_attach {
+            return is_window_allowed(
+                info.pid,
+                tracked_pids,
+                true,
+                &self.config.allow_process,
+                None,
+            );
+        }
+        if self.config.allow_process.is_empty() {
+            return is_window_allowed(info.pid, tracked_pids, false, &[], None);
+        }
+        let proc_name = process_exe_name(info.pid);
+        is_window_allowed(
+            info.pid,
+            tracked_pids,
+            false,
+            &self.config.allow_process,
+            proc_name.as_deref(),
+        )
     }
 
     fn capture_and_encode(&self, wid: WindowId) -> AppResult<String> {
@@ -149,14 +183,27 @@ impl RustSightServer {
         }
     }
 
-    /// List all visible top-level GUI windows (id, pid, title, size) so you can inspect already-running apps without `launch`.
+    /// List visible top-level GUI windows allowed by the active attach policy (id, pid, title, size).
     #[tool(
         name = "list_windows",
-        description = "List all visible top-level GUI windows with their window_id, pid, title, and size. Useful for attaching to an already-running app."
+        description = "List visible top-level GUI windows allowed by the current policy (by default only apps launched by RustSight; use --allow-attach or --allow-process to attach to other apps)."
     )]
     async fn list_windows(&self) -> CallToolResult {
         let this = self.clone();
-        let res = tokio::task::spawn_blocking(move || this.capture.list_windows()).await;
+        let res = tokio::task::spawn_blocking(move || -> AppResult<Vec<WindowInfo>> {
+            let tracked_pids = {
+                let pm = this.processes.lock().map_err(|_| {
+                    RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
+                })?;
+                pm.tracked_pids()
+            };
+            let windows = this.capture.list_windows()?;
+            Ok(windows
+                .into_iter()
+                .filter(|w| this.is_window_info_allowed(w, &tracked_pids))
+                .collect())
+        })
+        .await;
         match res {
             Ok(Ok(windows)) => {
                 let lines: Vec<String> = windows
@@ -169,7 +216,14 @@ impl RustSightServer {
                     })
                     .collect();
                 let body = if lines.is_empty() {
-                    "No visible windows found.".to_string()
+                    if !self.config.allow_attach && self.config.allow_process.is_empty() {
+                        "No allowed windows found. Attach mode is off by default (only windows launched by RustSight are accessible). To enable attaching to existing windows, restart RustSight with `--allow-attach` or `--allow-process <NAME>` (e.g., `--allow-process notepad.exe`).".to_string()
+                    } else if !self.config.allow_attach {
+                        "No allowed windows found matching launched apps or `--allow-process`."
+                            .to_string()
+                    } else {
+                        "No visible windows found.".to_string()
+                    }
                 } else {
                     lines.join("\n")
                 };
@@ -614,10 +668,11 @@ impl RustSightServer {
     async fn close(&self, Parameters(params): Parameters<WindowIdParams>) -> CallToolResult {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<WindowId> {
+            let info = this.resolve_window(params.window_id)?;
             let mut pm = this.processes.lock().map_err(|_| {
                 RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
             })?;
-            pm.close(params.window_id)
+            pm.close(Some(info.id))
         })
         .await;
 
@@ -640,5 +695,88 @@ impl ServerHandler for RustSightServer {
                 "RustSight lets you launch, see (via PNG screenshots & GIF frame bursts), and control any native GUI application. \
                  Call `launch` with a Cargo project directory or binary path first, then interact using `click`, `type_text`, `press_key`, `scroll`, `drag`, `capture_frames`, `wait_idle`, `rebuild`, and `close`.",
             )
+    }
+}
+
+/// Pure policy check deciding whether a window with `window_pid` may be accessed.
+pub fn is_window_allowed(
+    window_pid: u32,
+    tracked_pids: &HashSet<u32>,
+    allow_attach: bool,
+    allow_process: &[String],
+    process_name: Option<&str>,
+) -> bool {
+    if tracked_pids.contains(&window_pid) || allow_attach {
+        return true;
+    }
+    let Some(name) = process_name else {
+        return false;
+    };
+    allow_process
+        .iter()
+        .any(|allowed| allowed.trim().eq_ignore_ascii_case(name.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_window_allowed;
+    use std::collections::HashSet;
+
+    #[test]
+    fn launched_pid_is_allowed_by_default() {
+        let tracked = HashSet::from([1234]);
+        assert!(is_window_allowed(1234, &tracked, false, &[], None));
+    }
+
+    #[test]
+    fn unknown_pid_is_denied_by_default() {
+        let tracked = HashSet::from([1234]);
+        assert!(!is_window_allowed(
+            5678,
+            &tracked,
+            false,
+            &[],
+            Some("notepad.exe")
+        ));
+    }
+
+    #[test]
+    fn allow_attach_allows_any_window() {
+        let tracked = HashSet::new();
+        assert!(is_window_allowed(5678, &tracked, true, &[], None));
+    }
+
+    #[test]
+    fn allow_process_allows_only_matching_names_case_insensitively() {
+        let tracked = HashSet::new();
+        let allowed = vec!["NotePad.exe".to_string(), "calc.exe".to_string()];
+        assert!(is_window_allowed(
+            5678,
+            &tracked,
+            false,
+            &allowed,
+            Some("notepad.exe")
+        ));
+        assert!(is_window_allowed(
+            5679,
+            &tracked,
+            false,
+            &allowed,
+            Some("CALC.EXE")
+        ));
+        assert!(!is_window_allowed(
+            5680,
+            &tracked,
+            false,
+            &allowed,
+            Some("1password.exe")
+        ));
+    }
+
+    #[test]
+    fn unreadable_process_name_is_denied_even_with_allow_process() {
+        let tracked = HashSet::new();
+        let allowed = vec!["notepad.exe".to_string()];
+        assert!(!is_window_allowed(5678, &tracked, false, &allowed, None));
     }
 }

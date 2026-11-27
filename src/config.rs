@@ -36,6 +36,14 @@ pub struct Config {
     /// Log level filter (e.g., info, debug, warn, error). Logs go to stderr.
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Permit `list_windows` and tools to target any visible window, not only apps launched by RustSight.
+    #[arg(long, default_value_t = false)]
+    pub allow_attach: bool,
+
+    /// Permit attaching to windows belonging to specific executable file names (repeatable, case-insensitive, e.g. `notepad.exe`).
+    #[arg(long = "allow-process", value_name = "NAME")]
+    pub allow_process: Vec<String>,
 }
 
 impl Config {

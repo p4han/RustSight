@@ -1,7 +1,7 @@
 use crate::backend::{WindowCaptureBackend, WindowId, WindowInfo};
 use crate::error::{Result, RustSightError};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,6 +36,127 @@ impl TrackedProcess {
 impl Drop for TrackedProcess {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(windows)]
+struct ScopedHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for ScopedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Returns `true` if `target_pid` is in `tracked_pids` or is a descendant of any PID in `tracked_pids`.
+pub fn is_pid_or_descendant_tracked(target_pid: u32, tracked_pids: &HashSet<u32>) -> bool {
+    if tracked_pids.is_empty() || target_pid == 0 {
+        return false;
+    }
+    if tracked_pids.contains(&target_pid) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::mem::size_of;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+
+        let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+            return false;
+        };
+        let _snap_guard = ScopedHandle(snap);
+
+        let mut parent_map: HashMap<u32, u32> = HashMap::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        unsafe {
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    parent_map.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut curr = target_pid;
+        let mut visited = HashSet::new();
+        for _ in 0..32 {
+            if !visited.insert(curr) {
+                break;
+            }
+            let Some(&parent) = parent_map.get(&curr) else {
+                break;
+            };
+            if parent == 0 || parent == curr {
+                break;
+            }
+            if tracked_pids.contains(&parent) {
+                return true;
+            }
+            curr = parent;
+        }
+        false
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Resolve the executable file name (e.g., `"notepad.exe"`) for `pid`.
+/// Returns `None` if the process cannot be opened or queried.
+pub fn process_exe_name(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        };
+        use windows::core::PWSTR;
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+        let _guard = ScopedHandle(handle);
+
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+            .ok()?;
+        }
+
+        let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+        Path::new(&full_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -109,6 +230,10 @@ impl ProcessManager {
     #[allow(dead_code)]
     pub fn active_window_id(&self) -> Option<WindowId> {
         self.active_window
+    }
+
+    pub fn tracked_pids(&self) -> HashSet<u32> {
+        self.processes.values().map(|p| p.pid).collect()
     }
 
     pub fn resolve_window_id(&self, window_id: Option<WindowId>) -> Result<WindowId> {

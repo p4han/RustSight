@@ -52,6 +52,9 @@ When the user points you to `https://github.com/p4han/RustSight` and asks you to
      ```
    *(If `rustsight` is not on `PATH`, use `%USERPROFILE%\.cargo\bin\rustsight.exe` as `"command"`.)*
 
+   **Optional attach flags (disabled by default for privacy/safety):**
+   By default, RustSight only accesses windows it launched (including their child processes). To attach to already-running windows, pass `--allow-process <NAME>` (repeatable, case-insensitive, e.g. `"--allow-process", "notepad.exe"`) or `--allow-attach` (allows all visible windows) in `"args"`.
+
 ## Usage Workflow
 
 1. **Launch** the app under test: call `launch(path_or_cargo_dir, width?, height?)` — if given a Cargo project directory, RustSight runs `cargo build`, spawns the binary, and returns the `window_id` plus the first PNG screenshot.

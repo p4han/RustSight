@@ -8,6 +8,15 @@ pub enum RustSightError {
     #[error("Window {0} not found or has been closed.")]
     WindowNotFound(u64),
 
+    #[error(
+        "Window `{title}` (window_id={window_id}, pid={pid}) is not allowed. By default RustSight only accesses windows it launched. Pass `--allow-attach` to allow all windows or `--allow-process <NAME>` (e.g. `--allow-process notepad.exe`) to allow specific executables."
+    )]
+    WindowNotAllowed {
+        window_id: u64,
+        pid: u32,
+        title: String,
+    },
+
     #[error("Build failed for `{path}` (exit code {code:?}):\n{output}")]
     BuildFailed {
         path: String,

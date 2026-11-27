@@ -98,7 +98,13 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 - `--build-timeout-secs <SECS>` (default: `300`) — Timeout for `cargo build`.
 - `--max-image-width <PX>` (default: `1920`) — Max width of screenshots returned to the MCP client (`0` disables downscaling).
 - `--default-max-frames <N>` (default: `3`) — Default max frames returned in chat by `capture_frames`.
+- `--allow-attach` (default: `false`) — Permit `list_windows` and tools to attach to any visible window on the machine, not just apps launched by RustSight.
+- `--allow-process <NAME>` (repeatable, case-insensitive) — Permit attaching only to windows belonging to specific executable file names (for example, `--allow-process notepad.exe`), without enabling full `--allow-attach`.
 - `--log-level <LEVEL>` (default: `info`) — Tracing log level (written to `stderr`).
+
+## Security
+
+By default, RustSight restricts all vision and input tools (`list_windows`, `screenshot`, `capture_frames`, `click`, `type_text`, `press_key`, `scroll`, `drag`, `wait_idle`, and `close`) to windows belonging to processes launched by RustSight in the current session (including their child processes). This prevents an agent from screenshotting or sending input to unrelated apps such as password managers, browsers, or chat clients. To attach to existing windows, explicitly opt in with `--allow-process <NAME>` or `--allow-attach`.
 
 ## Architecture
 
