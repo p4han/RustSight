@@ -25,6 +25,10 @@ pub struct Config {
     #[arg(long, default_value_t = 300)]
     pub build_timeout_secs: u64,
 
+    /// Timeout (seconds) waiting for a launched app's main window to appear.
+    #[arg(long, default_value_t = 15)]
+    pub window_timeout_secs: u64,
+
     /// Maximum width (px) of screenshots returned to the MCP client (0 = no downscaling).
     #[arg(long, default_value_t = 1920)]
     pub max_image_width: u32,

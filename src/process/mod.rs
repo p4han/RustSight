@@ -18,7 +18,7 @@ pub struct LaunchSpec {
     pub height: Option<u32>,
 }
 
-struct TrackedProcess {
+pub struct TrackedProcess {
     child: Child,
     pid: u32,
     window_id: WindowId,
@@ -212,6 +212,12 @@ fn create_kill_on_close_job(child: &Child) -> Option<WindowsJob> {
     }
 }
 
+pub struct PreparedLaunch {
+    pub info: WindowInfo,
+    pub spec: LaunchSpec,
+    process: TrackedProcess,
+}
+
 pub struct ProcessManager {
     processes: HashMap<WindowId, TrackedProcess>,
     active_window: Option<WindowId>,
@@ -243,117 +249,29 @@ impl ProcessManager {
         }
     }
 
-    pub fn launch(
-        &mut self,
-        spec: LaunchSpec,
-        capture: &dyn WindowCaptureBackend,
-        build_timeout: Duration,
-    ) -> Result<WindowInfo> {
-        let target = Path::new(&spec.path_or_cargo_dir);
-        let exe_path = if let Some(manifest_path) = detect_cargo_manifest(target) {
-            info!("Building Cargo project at {}", manifest_path.display());
-            build_cargo_project(&manifest_path, build_timeout)?
-        } else {
-            if !target.exists() {
-                return Err(RustSightError::BinaryNotFound(
-                    spec.path_or_cargo_dir.clone(),
-                    "Path does not exist".to_string(),
-                ));
-            }
-            target.to_path_buf()
-        };
-
-        info!("Spawning {}", exe_path.display());
-        let working_dir = if let Some(manifest) = detect_cargo_manifest(target) {
-            manifest.parent().map(|p| p.to_path_buf())
-        } else {
-            exe_path.parent().map(|p| p.to_path_buf())
-        };
-
-        let mut cmd = Command::new(&exe_path);
-        cmd.args(&spec.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
-
-        let mut child = cmd.spawn().map_err(|e| {
-            RustSightError::LaunchFailed(exe_path.display().to_string(), e.to_string())
-        })?;
-        let pid = child.id();
-
-        #[cfg(windows)]
-        let job = create_kill_on_close_job(&child);
-
-        // Wait for the main window to appear
-        let timeout_ms = 15_000u64;
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let mut info = loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(RustSightError::LaunchFailed(
-                    exe_path.display().to_string(),
-                    format!("Process exited immediately with status: {status}"),
-                ));
-            }
-            if let Some(win) = capture.find_window_by_pid(pid)? {
-                break win;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RustSightError::WindowTimeout(timeout_ms, pid));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-
-        if let (Some(w), Some(h)) = (spec.width, spec.height) {
-            if let Err(e) = capture.resize_window(info.id, w, h) {
-                warn!("Failed to resize window {}: {e}", info.id);
-            } else {
-                std::thread::sleep(Duration::from_millis(100));
-                if let Ok(updated) = capture.get_window_info(info.id) {
-                    info = updated;
-                }
-            }
-        }
-
-        // Give the GUI a brief moment to render its first frame
-        std::thread::sleep(Duration::from_millis(150));
-
-        let wid = info.id;
-        self.processes.insert(
-            wid,
-            TrackedProcess {
-                child,
-                pid,
-                window_id: wid,
-                #[cfg(windows)]
-                _job: job,
-            },
-        );
+    /// Briefly register a completed [`PreparedLaunch`] under the manager lock.
+    pub fn register_launched(&mut self, prepared: PreparedLaunch) -> WindowInfo {
+        let wid = prepared.info.id;
+        self.processes.insert(wid, prepared.process);
         self.active_window = Some(wid);
-        self.last_spec = Some(spec);
-
-        Ok(info)
+        self.last_spec = Some(prepared.spec);
+        prepared.info
     }
 
-    pub fn rebuild(
-        &mut self,
-        capture: &dyn WindowCaptureBackend,
-        build_timeout: Duration,
-    ) -> Result<WindowInfo> {
+    /// Clone `last_spec` and remove the active process so it can be killed outside the lock
+    /// before rebuilding.
+    pub fn take_rebuild_target(&mut self) -> Result<(LaunchSpec, Option<TrackedProcess>)> {
         let spec = self
             .last_spec
             .clone()
             .ok_or(RustSightError::NothingToRebuild)?;
-
-        if let Some(wid) = self.active_window {
-            let _ = self.close(Some(wid));
+        let old_proc = self
+            .active_window
+            .and_then(|wid| self.processes.remove(&wid));
+        if old_proc.is_some() {
+            self.active_window = self.processes.keys().next().copied();
         }
-
-        self.launch(spec, capture, build_timeout)
+        Ok((spec, old_proc))
     }
 
     pub fn close(&mut self, window_id: Option<WindowId>) -> Result<WindowId> {
@@ -375,6 +293,122 @@ impl ProcessManager {
         }
         self.active_window = None;
     }
+}
+
+/// Build (if Cargo project), spawn the process, and wait for its main window without holding
+/// any `ProcessManager` lock. If any step fails before returning, the local [`TrackedProcess`]
+/// is dropped and automatically kills the spawned child process.
+pub fn prepare_launch(
+    spec: LaunchSpec,
+    capture: &dyn WindowCaptureBackend,
+    build_timeout: Duration,
+    window_timeout: Duration,
+) -> Result<PreparedLaunch> {
+    prepare_launch_with(
+        spec,
+        capture,
+        build_timeout,
+        window_timeout,
+        build_cargo_project,
+    )
+}
+
+pub fn prepare_launch_with<F>(
+    spec: LaunchSpec,
+    capture: &dyn WindowCaptureBackend,
+    build_timeout: Duration,
+    window_timeout: Duration,
+    builder: F,
+) -> Result<PreparedLaunch>
+where
+    F: FnOnce(&Path, Duration) -> Result<PathBuf>,
+{
+    let target = Path::new(&spec.path_or_cargo_dir);
+    let manifest = detect_cargo_manifest(target);
+    let exe_path = if let Some(ref manifest_path) = manifest {
+        info!("Building Cargo project at {}", manifest_path.display());
+        builder(manifest_path, build_timeout)?
+    } else {
+        if !target.exists() {
+            return Err(RustSightError::BinaryNotFound(
+                spec.path_or_cargo_dir.clone(),
+                "Path does not exist".to_string(),
+            ));
+        }
+        target.to_path_buf()
+    };
+
+    info!("Spawning {}", exe_path.display());
+    let working_dir = if let Some(ref manifest_path) = manifest {
+        manifest_path.parent().map(|p| p.to_path_buf())
+    } else {
+        exe_path.parent().map(|p| p.to_path_buf())
+    };
+
+    let mut cmd = Command::new(&exe_path);
+    cmd.args(&spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| RustSightError::LaunchFailed(exe_path.display().to_string(), e.to_string()))?;
+    let pid = child.id();
+
+    #[cfg(windows)]
+    let job = create_kill_on_close_job(&child);
+
+    // Keep child + job in a local TrackedProcess so Drop cleans it up if anything fails below.
+    let mut tracked = TrackedProcess {
+        child,
+        pid,
+        window_id: 0,
+        #[cfg(windows)]
+        _job: job,
+    };
+
+    let timeout_ms = window_timeout.as_millis() as u64;
+    let deadline = Instant::now() + window_timeout;
+    let mut info = loop {
+        if let Ok(Some(status)) = tracked.child.try_wait() {
+            return Err(RustSightError::LaunchFailed(
+                exe_path.display().to_string(),
+                format!("Process exited immediately with status: {status}"),
+            ));
+        }
+        if let Some(win) = capture.find_window_by_pid(pid)? {
+            break win;
+        }
+        if Instant::now() >= deadline {
+            return Err(RustSightError::WindowTimeout(timeout_ms, pid));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    if let (Some(w), Some(h)) = (spec.width, spec.height) {
+        if let Err(e) = capture.resize_window(info.id, w, h) {
+            warn!("Failed to resize window {}: {e}", info.id);
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(updated) = capture.get_window_info(info.id) {
+                info = updated;
+            }
+        }
+    }
+
+    // Give the GUI a brief moment to render its first frame
+    std::thread::sleep(Duration::from_millis(150));
+
+    tracked.window_id = info.id;
+    Ok(PreparedLaunch {
+        info,
+        spec,
+        process: tracked,
+    })
 }
 
 impl Drop for ProcessManager {
@@ -495,4 +529,133 @@ fn build_cargo_project(manifest_path: &Path, timeout: Duration) -> Result<PathBu
             "Cargo build succeeded, but no binary executable artifact was produced.".to_string(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{CapturedFrame, WindowRect};
+    use std::sync::{Arc, Mutex};
+
+    struct DummyCapture;
+    impl WindowCaptureBackend for DummyCapture {
+        fn init(&self) -> Result<()> {
+            Ok(())
+        }
+        fn find_window_by_pid(&self, _pid: u32) -> Result<Option<WindowInfo>> {
+            Ok(None)
+        }
+        fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_window_info(&self, window_id: WindowId) -> Result<WindowInfo> {
+            Ok(WindowInfo {
+                id: window_id,
+                pid: 0,
+                title: String::new(),
+                rect: WindowRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                dpi_scale: 1.0,
+                is_minimized: false,
+            })
+        }
+        fn is_window_alive(&self, _window_id: WindowId) -> bool {
+            false
+        }
+        fn capture_window(&self, _window_id: WindowId) -> Result<CapturedFrame> {
+            Ok(CapturedFrame {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+            })
+        }
+        fn resize_window(&self, _window_id: WindowId, _w: u32, _h: u32) -> Result<()> {
+            Ok(())
+        }
+        fn focus_window(&self, _window_id: WindowId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn slow_build_does_not_block_process_manager_lock() {
+        let pm = Arc::new(Mutex::new(ProcessManager::new()));
+        let (build_started_tx, build_started_rx) = std::sync::mpsc::channel();
+        let (allow_finish_tx, allow_finish_rx) = std::sync::mpsc::channel();
+
+        let manifest_dir = std::env::current_dir().unwrap();
+        let spec = LaunchSpec {
+            path_or_cargo_dir: manifest_dir.display().to_string(),
+            args: Vec::new(),
+            width: None,
+            height: None,
+        };
+
+        let handle = std::thread::spawn(move || {
+            prepare_launch_with(
+                spec,
+                &DummyCapture,
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+                move |_manifest, _timeout| {
+                    build_started_tx.send(()).unwrap();
+                    allow_finish_rx.recv().unwrap();
+                    Err(RustSightError::BuildFailed {
+                        path: "simulated".into(),
+                        code: Some(1),
+                        output: "simulated failure".into(),
+                    })
+                },
+            )
+        });
+
+        build_started_rx.recv().unwrap();
+
+        // While the slow build is running, ProcessManager lock is immediately available.
+        let mut guard = pm
+            .try_lock()
+            .expect("ProcessManager lock should not be held during build");
+        assert!(guard.tracked_pids().is_empty());
+        assert!(matches!(
+            guard.resolve_window_id(None),
+            Err(RustSightError::NoActiveWindow)
+        ));
+        assert!(matches!(guard.close(Some(123)), Ok(123)));
+        drop(guard);
+
+        allow_finish_tx.send(()).unwrap();
+        let res = handle.join().unwrap();
+        assert!(matches!(res, Err(RustSightError::BuildFailed { .. })));
+    }
+
+    #[test]
+    fn failed_launch_leaves_no_tracked_process_or_active_window() {
+        let pm = ProcessManager::new();
+        let spec = LaunchSpec {
+            path_or_cargo_dir: "nonexistent_rustsight_binary_12345.exe".to_string(),
+            args: Vec::new(),
+            width: None,
+            height: None,
+        };
+        let res = prepare_launch(
+            spec,
+            &DummyCapture,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(matches!(res, Err(RustSightError::BinaryNotFound(_, _))));
+        assert!(pm.tracked_pids().is_empty());
+        assert!(pm.active_window_id().is_none());
+    }
+
+    #[test]
+    fn rebuild_without_previous_launch_returns_nothing_to_rebuild() {
+        let mut pm = ProcessManager::new();
+        let res = pm.take_rebuild_target();
+        assert!(matches!(res, Err(RustSightError::NothingToRebuild)));
+    }
 }

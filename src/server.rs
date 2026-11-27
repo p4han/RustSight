@@ -7,7 +7,9 @@ use crate::capture::{
 };
 use crate::config::Config;
 use crate::error::{Result as AppResult, RustSightError};
-use crate::process::{LaunchSpec, ProcessManager, is_pid_or_descendant_tracked, process_exe_name};
+use crate::process::{
+    LaunchSpec, ProcessManager, is_pid_or_descendant_tracked, prepare_launch, process_exe_name,
+};
 use crate::tools::{
     CaptureFramesParams, ClickParams, DragParams, LaunchParams, PressKeyParams, ScreenshotParams,
     ScrollParams, TypeTextParams, WaitIdleParams, WindowIdParams,
@@ -19,7 +21,7 @@ use rmcp::model::{
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -28,8 +30,18 @@ pub struct RustSightServer {
     capture: Arc<Box<dyn WindowCaptureBackend>>,
     input: Arc<Box<dyn InputBackend>>,
     processes: Arc<Mutex<ProcessManager>>,
+    /// Serializes `launch` and `rebuild` so concurrent Cargo builds do not contend on `target/`.
+    /// Other tools never acquire this gate.
+    launch_gate: Arc<Mutex<()>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+fn lock_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("{name} mutex was poisoned; recovering inner state");
+        poisoned.into_inner()
+    })
 }
 
 struct CropBox {
@@ -57,21 +69,33 @@ impl RustSightServer {
             capture: Arc::new(capture),
             input: Arc::new(input),
             processes: Arc::new(Mutex::new(ProcessManager::new())),
+            launch_gate: Arc::new(Mutex::new(())),
             tool_router: Self::tool_router(),
         }
     }
 
     pub fn shutdown(&self) {
-        if let Ok(mut pm) = self.processes.lock() {
-            pm.cleanup_all();
+        let mut pm = lock_recover(&self.processes, "ProcessManager");
+        pm.cleanup_all();
+    }
+
+    fn try_lock_launch_gate(&self, op: &str) -> AppResult<MutexGuard<'_, ()>> {
+        match self.launch_gate.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                tracing::warn!("launch_gate mutex was poisoned; recovering inner state");
+                Ok(poisoned.into_inner())
+            }
+            Err(TryLockError::WouldBlock) => Err(RustSightError::LaunchFailed(
+                op.to_string(),
+                "Another launch or rebuild is already in progress; wait for it to finish before starting a new one.".to_string(),
+            )),
         }
     }
 
     fn resolve_window(&self, window_id: Option<WindowId>) -> AppResult<WindowInfo> {
         let (wid, tracked_pids) = {
-            let pm = self.processes.lock().map_err(|_| {
-                RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
-            })?;
+            let pm = lock_recover(&self.processes, "ProcessManager");
             (pm.resolve_window_id(window_id)?, pm.tracked_pids())
         };
         let info = self.capture.get_window_info(wid)?;
@@ -83,6 +107,12 @@ impl RustSightServer {
             });
         }
         Ok(info)
+    }
+
+    fn close_window_checked(&self, window_id: Option<WindowId>) -> AppResult<WindowId> {
+        let info = self.resolve_window(window_id)?;
+        let mut pm = lock_recover(&self.processes, "ProcessManager");
+        pm.close(Some(info.id))
     }
 
     fn is_window_info_allowed(&self, info: &WindowInfo, tracked_pids: &HashSet<u32>) -> bool {
@@ -192,18 +222,24 @@ impl RustSightServer {
     async fn launch(&self, Parameters(params): Parameters<LaunchParams>) -> CallToolResult {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage)> {
+            let _gate = this.try_lock_launch_gate("launch")?;
             let spec = LaunchSpec {
                 path_or_cargo_dir: params.path_or_cargo_dir,
                 args: params.args,
                 width: params.width.or(this.config.default_width),
                 height: params.height.or(this.config.default_height),
             };
-            let timeout = Duration::from_secs(this.config.build_timeout_secs);
+            let build_timeout = Duration::from_secs(this.config.build_timeout_secs);
+            let window_timeout = Duration::from_secs(this.config.window_timeout_secs);
+            let prepared = prepare_launch(
+                spec,
+                this.capture.as_ref().as_ref(),
+                build_timeout,
+                window_timeout,
+            )?;
             let info = {
-                let mut pm = this.processes.lock().map_err(|_| {
-                    RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
-                })?;
-                pm.launch(spec, this.capture.as_ref().as_ref(), timeout)?
+                let mut pm = lock_recover(&this.processes, "ProcessManager");
+                pm.register_launched(prepared)
             };
             let img = this.capture_and_encode(info.id)?;
             Ok((info, img))
@@ -235,9 +271,7 @@ impl RustSightServer {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<Vec<WindowInfo>> {
             let tracked_pids = {
-                let pm = this.processes.lock().map_err(|_| {
-                    RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
-                })?;
+                let pm = lock_recover(&this.processes, "ProcessManager");
                 pm.tracked_pids()
             };
             let windows = this.capture.list_windows()?;
@@ -718,12 +752,25 @@ impl RustSightServer {
     async fn rebuild(&self) -> CallToolResult {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage)> {
-            let timeout = Duration::from_secs(this.config.build_timeout_secs);
+            let _gate = this.try_lock_launch_gate("rebuild")?;
+            let (spec, old_proc) = {
+                let mut pm = lock_recover(&this.processes, "ProcessManager");
+                pm.take_rebuild_target()?
+            };
+            // Kill/drop the previous process outside the ProcessManager lock.
+            drop(old_proc);
+
+            let build_timeout = Duration::from_secs(this.config.build_timeout_secs);
+            let window_timeout = Duration::from_secs(this.config.window_timeout_secs);
+            let prepared = prepare_launch(
+                spec,
+                this.capture.as_ref().as_ref(),
+                build_timeout,
+                window_timeout,
+            )?;
             let info = {
-                let mut pm = this.processes.lock().map_err(|_| {
-                    RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
-                })?;
-                pm.rebuild(this.capture.as_ref().as_ref(), timeout)?
+                let mut pm = lock_recover(&this.processes, "ProcessManager");
+                pm.register_launched(prepared)
             };
             let img = this.capture_and_encode(info.id)?;
             Ok((info, img))
@@ -757,11 +804,7 @@ impl RustSightServer {
     async fn close(&self, Parameters(params): Parameters<WindowIdParams>) -> CallToolResult {
         let this = self.clone();
         let res = tokio::task::spawn_blocking(move || -> AppResult<WindowId> {
-            let info = this.resolve_window(params.window_id)?;
-            let mut pm = this.processes.lock().map_err(|_| {
-                RustSightError::CaptureFailed("ProcessManager lock poisoned".into())
-            })?;
-            pm.close(Some(info.id))
+            this.close_window_checked(params.window_id)
         })
         .await;
 
@@ -808,7 +851,7 @@ pub fn is_window_allowed(
 
 #[cfg(test)]
 mod tests {
-    use super::is_window_allowed;
+    use super::{AppResult, RustSightError, is_window_allowed};
     use std::collections::HashSet;
 
     #[test]
@@ -867,5 +910,108 @@ mod tests {
         let tracked = HashSet::new();
         let allowed = vec!["notepad.exe".to_string()];
         assert!(!is_window_allowed(5678, &tracked, false, &allowed, None));
+    }
+
+    #[test]
+    fn close_rejects_unlaunched_window_when_restricted_and_allows_with_attach() {
+        use crate::backend::{
+            CapturedFrame, InputBackend, Modifiers, MouseButton, WindowCaptureBackend, WindowId,
+            WindowInfo, WindowRect,
+        };
+        use crate::config::Config;
+        use clap::Parser;
+
+        struct MockCapture(WindowInfo);
+        impl WindowCaptureBackend for MockCapture {
+            fn init(&self) -> AppResult<()> {
+                Ok(())
+            }
+            fn find_window_by_pid(&self, _pid: u32) -> AppResult<Option<WindowInfo>> {
+                Ok(None)
+            }
+            fn list_windows(&self) -> AppResult<Vec<WindowInfo>> {
+                Ok(vec![self.0.clone()])
+            }
+            fn get_window_info(&self, window_id: WindowId) -> AppResult<WindowInfo> {
+                if window_id == self.0.id {
+                    Ok(self.0.clone())
+                } else {
+                    Err(RustSightError::WindowNotFound(window_id))
+                }
+            }
+            fn is_window_alive(&self, window_id: WindowId) -> bool {
+                window_id == self.0.id
+            }
+            fn capture_window(&self, _window_id: WindowId) -> AppResult<CapturedFrame> {
+                Ok(CapturedFrame {
+                    width: 100,
+                    height: 100,
+                    rgba: vec![0; 100 * 100 * 4],
+                })
+            }
+            fn resize_window(&self, _window_id: WindowId, _w: u32, _h: u32) -> AppResult<()> {
+                Ok(())
+            }
+            fn focus_window(&self, _window_id: WindowId) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        struct NoopInput;
+        impl InputBackend for NoopInput {
+            fn click(
+                &self,
+                _: &WindowInfo,
+                _: i32,
+                _: i32,
+                _: MouseButton,
+                _: bool,
+            ) -> AppResult<()> {
+                Ok(())
+            }
+            fn type_text(&self, _: &WindowInfo, _: &str) -> AppResult<()> {
+                Ok(())
+            }
+            fn press_key(&self, _: &WindowInfo, _: &str, _: &Modifiers) -> AppResult<()> {
+                Ok(())
+            }
+            fn scroll(&self, _: &WindowInfo, _: i32, _: i32, _: i32, _: i32) -> AppResult<()> {
+                Ok(())
+            }
+            fn drag(&self, _: &WindowInfo, _: i32, _: i32, _: i32, _: i32) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        let foreign_win = WindowInfo {
+            id: 9999,
+            pid: 424242,
+            title: "Foreign App".to_string(),
+            rect: WindowRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            dpi_scale: 1.0,
+            is_minimized: false,
+        };
+
+        let restricted_cfg = Config::parse_from(["rustsight"]);
+        let restricted = super::RustSightServer::new(
+            restricted_cfg,
+            Box::new(MockCapture(foreign_win.clone())),
+            Box::new(NoopInput),
+        );
+        let err = restricted.close_window_checked(Some(9999)).unwrap_err();
+        assert!(matches!(err, RustSightError::WindowNotAllowed { .. }));
+
+        let attach_cfg = Config::parse_from(["rustsight", "--allow-attach"]);
+        let allowed = super::RustSightServer::new(
+            attach_cfg,
+            Box::new(MockCapture(foreign_win)),
+            Box::new(NoopInput),
+        );
+        assert_eq!(allowed.close_window_checked(Some(9999)).unwrap(), 9999);
     }
 }

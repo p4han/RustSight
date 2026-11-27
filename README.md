@@ -96,6 +96,7 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 - `--capture-dir <PATH>` — Directory for saving animated GIFs from `capture_frames` (defaults to OS temp dir).
 - `--default-width <PX>` / `--default-height <PX>` — Default window size on `launch`.
 - `--build-timeout-secs <SECS>` (default: `300`) — Timeout for `cargo build`.
+- `--window-timeout-secs <SECS>` (default: `15`) — Timeout waiting for a launched app's main window to appear.
 - `--max-image-width <PX>` (default: `1920`) — Max width of screenshots returned to the MCP client (`0` disables downscaling).
 - `--default-max-frames <N>` (default: `3`) — Default max frames returned in chat by `capture_frames`.
 - `--allow-attach` (default: `false`) — Permit `list_windows` and tools to attach to any visible window on the machine, not just apps launched by RustSight.
