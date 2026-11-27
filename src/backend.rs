@@ -184,6 +184,56 @@ pub trait InputBackend: Send + Sync {
         to_x: i32,
         to_y: i32,
     ) -> Result<()>;
+
+    fn mouse_move(&self, window: &WindowInfo, x: i32, y: i32) -> Result<()>;
+
+    fn focus(&self, window: &WindowInfo) -> Result<()>;
+}
+
+/// A node in the native UI accessibility tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiNode {
+    pub role: String,
+    pub name: String,
+    pub automation_id: String,
+    pub class_name: String,
+    pub is_enabled: bool,
+    pub has_keyboard_focus: bool,
+    pub is_offscreen: bool,
+    /// Bounding rectangle in physical screen pixels.
+    pub rect: WindowRect,
+    pub children: Vec<UiNode>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UiTreeOptions {
+    pub max_depth: usize,
+    pub max_nodes: usize,
+    pub include_offscreen: bool,
+    pub timeout: Duration,
+}
+
+impl Default for UiTreeOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: 6,
+            max_nodes: 300,
+            include_offscreen: false,
+            timeout: Duration::from_secs(3),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UiTreeResult {
+    pub roots: Vec<UiNode>,
+    pub truncated_count: usize,
+    pub timed_out: bool,
+}
+
+/// Platform-agnostic UI accessibility tree backend.
+pub trait UiTreeBackend: Send + Sync {
+    fn get_ui_tree(&self, window_id: WindowId, opts: UiTreeOptions) -> Result<UiTreeResult>;
 }
 
 #[cfg(test)]

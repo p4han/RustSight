@@ -6,6 +6,7 @@ mod input;
 mod process;
 mod server;
 mod tools;
+mod ui_tree;
 
 use clap::Parser;
 use config::Config;
@@ -30,8 +31,9 @@ async fn main() -> anyhow::Result<()> {
     let capture = capture::create_capture_backend();
     capture.init()?;
     let input = input::create_input_backend();
+    let ui_tree = ui_tree::create_ui_tree_backend();
 
-    let server = RustSightServer::new(config, capture, input);
+    let server = RustSightServer::new(config, capture, input, ui_tree);
     let shutdown_handle = server.clone();
 
     info!("Starting rustsight MCP server on stdio");

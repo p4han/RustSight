@@ -81,7 +81,13 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 | `launch(path_or_cargo_dir, args?, width?, height?, bin?, package?, release?, features?, all_features?)` | Build (if Cargo project) and launch the app, returning `window_id` + first screenshot. |
 | `screenshot(window_id?)` | Capture a PNG screenshot of the window. |
 | `capture_frames(window_id?, duration_ms=1500, fps=10)` | Burst-capture frames, returning up to 12 PNGs + an animated GIF path on disk. |
+| `get_ui_tree(window_id?, max_depth?, max_nodes?, include_offscreen?, include_screenshot?)` | Inspect the Windows UI Automation tree with element IDs, roles, names, flags, and screenshot-space centers. |
+| `find_element(name?, role?, automation_id?, window_id?, max_results?)` | Search the UI Automation tree (case-insensitive substring on `name`, exact `role` / `automation_id`). |
+| `click_element(name?, role?, automation_id?, index?, button?, double?, window_id?)` | Find a UI Automation element and click its center (requires `index` when multiple match). |
 | `click(x, y, button?, double?, window_id?)` | Click at window-relative pixel `(x, y)` and return a fresh screenshot. |
+| `hover(x, y, window_id?, include_screenshot?)` | Move the mouse cursor to `(x, y)` without clicking and return a fresh screenshot. |
+| `focus(window_id?)` | Bring the window to the foreground using verified focus logic and return a screenshot. |
+| `resize_window(width, height, window_id?)` | Resize the window (`100` to `8000` px) and return the new size + screenshot. |
 | `type_text(text, window_id?)` | Type Unicode text into the window and return a fresh screenshot. |
 | `press_key(key, modifiers?, window_id?)` | Press a key with optional modifiers (`ctrl`, `alt`, `shift`, `win`) and return a fresh screenshot. |
 | `scroll(x, y, dx?, dy?, window_id?)` | Scroll at `(x, y)` and return a fresh screenshot. |
@@ -108,6 +114,13 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 ## Security
 
 By default, RustSight restricts all vision and input tools (`list_windows`, `screenshot`, `capture_frames`, `click`, `type_text`, `press_key`, `scroll`, `drag`, `wait_idle`, and `close`) to windows belonging to processes launched by RustSight in the current session (including their child processes). This prevents an agent from screenshotting or sending input to unrelated apps such as password managers, browsers, or chat clients. To attach to existing windows, explicitly opt in with `--allow-process <NAME>` or `--allow-attach`.
+
+## Accessibility Trees (`get_ui_tree` / `find_element` / `click_element`)
+
+RustSight inspects native Windows UI Automation trees (`IUIAutomation`) and converts element bounding boxes into the same screenshot coordinate space used by `click`. Password fields (`IsPassword`) are masked as `[password field]`.
+
+- **Works out of the box**: Win32 controls, WPF, WinUI 3, Tauri/WebView2, Slint (with accessibility), and `egui` apps with AccessKit enabled.
+- **Falls back to coordinates**: Custom-drawn canvases and `egui` apps without AccessKit expose little or no UI Automation tree — in those cases `get_ui_tree` reports that no elements are exposed so you can use screenshot-based `click(x, y)`.
 
 ## Architecture
 

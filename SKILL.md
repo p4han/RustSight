@@ -58,8 +58,10 @@ When the user points you to `https://github.com/p4han/RustSight` and asks you to
 ## Usage Workflow
 
 1. **Launch** the app under test: call `launch(path_or_cargo_dir, width?, height?, bin?, package?, release?, features?, all_features?)` — if given a Cargo project directory, RustSight runs `cargo build`, spawns the binary, and returns the `window_id` plus the first PNG screenshot.
-2. **Inspect & Interact**:
-   - `click(x, y, button?, double?)` — click at screenshot pixel coordinates.
+2. **Inspect & Interact** *(tip: try `get_ui_tree` / `find_element` / `click_element` first for semantic UI controls, and fall back to screenshot coordinates `click(x, y)` for custom-drawn or non-AccessKit UIs)*:
+   - `get_ui_tree(window_id?, max_depth?, max_nodes?)` / `find_element(name?, role?, automation_id?)` — inspect native UI Automation elements and coordinates.
+   - `click_element(...)` / `click(x, y, button?, double?)` — click by element selector or screenshot pixel coordinates.
+   - `hover(x, y)` / `focus()` / `resize_window(width, height)` — move cursor, focus window, or resize.
    - `type_text(text)` / `press_key(key, modifiers?)` — type or send shortcuts.
    - `scroll(x, y, dx?, dy?)` / `drag(from_x, from_y, to_x, to_y)` — scroll or drag.
    - `capture_frames(duration_ms?, fps?)` — inspect animations (returns up to 12 PNGs + an animated GIF path).

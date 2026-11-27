@@ -1,5 +1,6 @@
 use crate::backend::{
-    CapturedFrame, InputBackend, Modifiers, MouseButton, WindowCaptureBackend, WindowId, WindowInfo,
+    CapturedFrame, InputBackend, Modifiers, MouseButton, UiTreeBackend, UiTreeOptions,
+    WindowCaptureBackend, WindowId, WindowInfo,
 };
 use crate::capture::{
     coord_scale, crop_frame, downscale_for_mcp, encode_gif, encode_png_base64, frames_differ,
@@ -11,8 +12,12 @@ use crate::process::{
     LaunchSpec, ProcessManager, is_pid_or_descendant_tracked, prepare_launch, process_exe_name,
 };
 use crate::tools::{
-    CaptureFramesParams, ClickParams, DragParams, GetLogsParams, LaunchParams, PressKeyParams,
+    CaptureFramesParams, ClickElementParams, ClickParams, DragParams, FindElementParams,
+    GetLogsParams, GetUiTreeParams, HoverParams, LaunchParams, PressKeyParams, ResizeWindowParams,
     ScreenshotParams, ScrollParams, TypeTextParams, WaitIdleParams, WindowIdParams,
+};
+use crate::ui_tree::{
+    FlatUiElement, filter_elements, flatten_ui_tree, format_element_line, format_ui_tree_output,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -29,6 +34,7 @@ pub struct RustSightServer {
     config: Arc<Config>,
     capture: Arc<Box<dyn WindowCaptureBackend>>,
     input: Arc<Box<dyn InputBackend>>,
+    ui_tree: Arc<Box<dyn UiTreeBackend>>,
     processes: Arc<Mutex<ProcessManager>>,
     /// Serializes `launch` and `rebuild` so concurrent Cargo builds do not contend on `target/`.
     /// Other tools never acquire this gate.
@@ -68,11 +74,13 @@ impl RustSightServer {
         config: Config,
         capture: Box<dyn WindowCaptureBackend>,
         input: Box<dyn InputBackend>,
+        ui_tree: Box<dyn UiTreeBackend>,
     ) -> Self {
         Self {
             config: Arc::new(config),
             capture: Arc::new(capture),
             input: Arc::new(input),
+            ui_tree: Arc::new(ui_tree),
             processes: Arc::new(Mutex::new(ProcessManager::new())),
             launch_gate: Arc::new(Mutex::new(())),
             tool_router: Self::tool_router(),
@@ -896,6 +904,279 @@ impl RustSightServer {
         }
     }
 
+    /// Inspect the native UI Automation accessibility tree of a window.
+    #[tool(
+        name = "get_ui_tree",
+        description = "Inspect the UI Automation accessibility tree of a window (default max_depth=6, max_nodes=300, offscreen excluded). Returns an indented outline with element `id`, role, name, automation_id, flags, and center/size in screenshot coordinates."
+    )]
+    async fn get_ui_tree(&self, Parameters(params): Parameters<GetUiTreeParams>) -> CallToolResult {
+        let this = self.clone();
+        let res =
+            tokio::task::spawn_blocking(move || -> AppResult<(String, Option<EncodedImage>)> {
+                let info = this.resolve_window(params.window_id)?;
+                let opts = UiTreeOptions {
+                    max_depth: params.max_depth.unwrap_or(6),
+                    max_nodes: params.max_nodes.unwrap_or(300),
+                    include_offscreen: params.include_offscreen,
+                    timeout: Duration::from_secs(3),
+                };
+                let tree = this.ui_tree.get_ui_tree(info.id, opts)?;
+                let (elements, truncated) =
+                    flatten_ui_tree(&tree, &info, opts, this.config.max_image_width);
+                let mut text = format_ui_tree_output(&elements, truncated, tree.timed_out, &info);
+                let img = if params.include_screenshot {
+                    let img = this.capture_and_encode(info.id)?;
+                    text.push_str(&format!("\n({})", Self::format_image_meta(&img, &info)));
+                    Some(img)
+                } else {
+                    None
+                };
+                Ok((text, img))
+            })
+            .await;
+
+        match res {
+            Ok(Ok((text, Some(img)))) => Self::ok_with_screenshot(text, img),
+            Ok(Ok((text, None))) => CallToolResult::success(vec![Content::text(text)]),
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
+        }
+    }
+
+    /// Find matching elements in the UI Automation tree by name, role, or automation_id.
+    #[tool(
+        name = "find_element",
+        description = "Search the window's UI Automation tree using case-insensitive substring match on `name` and exact match on `role` and `automation_id`. Returns matching elements with center coordinates ready for `click`."
+    )]
+    async fn find_element(
+        &self,
+        Parameters(params): Parameters<FindElementParams>,
+    ) -> CallToolResult {
+        let this = self.clone();
+        let res = tokio::task::spawn_blocking(move || -> AppResult<String> {
+            let info = this.resolve_window(params.window_id)?;
+            let opts = UiTreeOptions::default();
+            let tree = this.ui_tree.get_ui_tree(info.id, opts)?;
+            let (elements, _) = flatten_ui_tree(&tree, &info, opts, this.config.max_image_width);
+            if elements.is_empty() {
+                return Ok(format_ui_tree_output(&elements, 0, tree.timed_out, &info));
+            }
+            let matches = filter_elements(
+                &elements,
+                params.name.as_deref(),
+                params.role.as_deref(),
+                params.automation_id.as_deref(),
+            );
+            if matches.is_empty() {
+                return Ok(format!(
+                    "No matching UI elements found in `{}` (searched {} elements).",
+                    info.title,
+                    elements.len()
+                ));
+            }
+            let max_res = params.max_results.unwrap_or(20).max(1);
+            let total = matches.len();
+            let mut lines: Vec<String> = matches
+                .into_iter()
+                .take(max_res)
+                .enumerate()
+                .map(|(idx, el)| format!("[match={idx}] {}", format_element_line(el, false)))
+                .collect();
+            if total > max_res {
+                lines.push(format!("... and {} more match(es).", total - max_res));
+            }
+            Ok(lines.join("\n"))
+        })
+        .await;
+
+        match res {
+            Ok(Ok(text)) => CallToolResult::success(vec![Content::text(text)]),
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
+        }
+    }
+
+    /// Find a UI element by selector and click its center.
+    #[tool(
+        name = "click_element",
+        description = "Find a UI Automation element by `name` (case-insensitive substring), `role` (exact), or `automation_id` (exact) and click its center. Pass `index` if multiple elements match."
+    )]
+    async fn click_element(
+        &self,
+        Parameters(params): Parameters<ClickElementParams>,
+    ) -> CallToolResult {
+        let this = self.clone();
+        let include = params.include_screenshot.unwrap_or(true);
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, FlatUiElement, Option<SettledCapture>)> {
+                let info = this.resolve_window(params.window_id)?;
+                let opts = UiTreeOptions::default();
+                let tree = this.ui_tree.get_ui_tree(info.id, opts)?;
+                let (elements, _) =
+                    flatten_ui_tree(&tree, &info, opts, this.config.max_image_width);
+                if elements.is_empty() {
+                    return Err(RustSightError::InputFailed(format!(
+                        "No accessibility elements exposed by `{}` (window_id={}). Use screenshot-based `click(x, y)` instead.",
+                        info.title, info.id
+                    )));
+                }
+                let matches = filter_elements(
+                    &elements,
+                    params.name.as_deref(),
+                    params.role.as_deref(),
+                    params.automation_id.as_deref(),
+                );
+                let target = resolve_click_element_target(&matches, params.index)?;
+                let (sx, sy) =
+                    this.resolve_image_coords(&info, target.center_x, target.center_y)?;
+                let btn = MouseButton::parse(params.button.as_deref().unwrap_or("left"))?;
+                this.input.click(&info, sx, sy, btn, params.double)?;
+                if include {
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, target, Some(cap)))
+                } else {
+                    Ok((info, target, None))
+                }
+            },
+        )
+        .await;
+
+        match res {
+            Ok(Ok((info, target, Some(cap)))) => Self::ok_with_screenshot(
+                format!(
+                    "Clicked element {} {:?} at ({}, {}) on `{}` ({}){}",
+                    target.role,
+                    target.name,
+                    target.center_x,
+                    target.center_y,
+                    info.title,
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
+                ),
+                cap.img,
+            ),
+            Ok(Ok((info, target, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Clicked element {} {:?} at ({}, {}) on `{}`",
+                target.role, target.name, target.center_x, target.center_y, info.title
+            ))]),
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
+        }
+    }
+
+    /// Move the mouse cursor to (x, y) without clicking.
+    #[tool(
+        name = "hover",
+        description = "Move the mouse cursor to (x, y) in pixels of the most recent full-window screenshot without clicking. Waits for the UI to settle and returns a fresh PNG screenshot unless include_screenshot=false."
+    )]
+    async fn hover(&self, Parameters(params): Parameters<HoverParams>) -> CallToolResult {
+        let this = self.clone();
+        let include = params.include_screenshot.unwrap_or(true);
+        let res = tokio::task::spawn_blocking(
+            move || -> AppResult<(WindowInfo, Option<SettledCapture>)> {
+                let info = this.resolve_window(params.window_id)?;
+                let (sx, sy) = this.resolve_image_coords(&info, params.x, params.y)?;
+                this.input.mouse_move(&info, sx, sy)?;
+                if include {
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(cap)))
+                } else {
+                    Ok((info, None))
+                }
+            },
+        )
+        .await;
+
+        match res {
+            Ok(Ok((info, Some(cap)))) => Self::ok_with_screenshot(
+                format!(
+                    "Hovered at ({}, {}) on `{}` ({}){}",
+                    params.x,
+                    params.y,
+                    info.title,
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
+                ),
+                cap.img,
+            ),
+            Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
+                "Hovered at ({}, {}) on `{}`",
+                params.x, params.y, info.title
+            ))]),
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
+        }
+    }
+
+    /// Bring the target window to the foreground and return a fresh screenshot.
+    #[tool(
+        name = "focus",
+        description = "Bring the target window to the foreground using verified focus logic and return a fresh PNG screenshot."
+    )]
+    async fn focus(&self, Parameters(params): Parameters<WindowIdParams>) -> CallToolResult {
+        let this = self.clone();
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage)> {
+            let info = this.resolve_window(params.window_id)?;
+            this.input.focus(&info)?;
+            let img = this.capture_and_encode(info.id)?;
+            Ok((info, img))
+        })
+        .await;
+
+        match res {
+            Ok(Ok((info, img))) => Self::ok_with_screenshot(
+                format!(
+                    "Focused `{}` (window_id={}, {})",
+                    info.title,
+                    info.id,
+                    Self::format_image_meta(&img, &info)
+                ),
+                img,
+            ),
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::InputFailed(e.to_string())),
+        }
+    }
+
+    /// Resize the target window and return the new size and a fresh screenshot.
+    #[tool(
+        name = "resize_window",
+        description = "Resize the target window to `width` x `height` (100 to 8000 px) and return the new size plus a fresh PNG screenshot."
+    )]
+    async fn resize_window(
+        &self,
+        Parameters(params): Parameters<ResizeWindowParams>,
+    ) -> CallToolResult {
+        let this = self.clone();
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage)> {
+            validate_resize_dims(params.width, params.height)?;
+            let info = this.resolve_window(params.window_id)?;
+            this.capture
+                .resize_window(info.id, params.width, params.height)?;
+            std::thread::sleep(Duration::from_millis(100));
+            let updated = this.capture.get_window_info(info.id)?;
+            let img = this.capture_and_encode(updated.id)?;
+            Ok((updated, img))
+        })
+        .await;
+
+        match res {
+            Ok(Ok((info, img))) => Self::ok_with_screenshot(
+                format!(
+                    "Resized `{}` (window_id={}) to {}x{} physical px ({})",
+                    info.title,
+                    info.id,
+                    info.rect.width,
+                    info.rect.height,
+                    Self::format_image_meta(&img, &info)
+                ),
+                img,
+            ),
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
+        }
+    }
+
     /// Close the tracked application window and terminate its process.
     #[tool(
         name = "close",
@@ -924,10 +1205,52 @@ impl ServerHandler for RustSightServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rustsight", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "RustSight lets you launch, see (via PNG screenshots & GIF frame bursts), and control any native GUI application. \
-                 Call `launch` with a Cargo project directory or binary path first, then interact using `click`, `type_text`, `press_key`, `scroll`, `drag`, `capture_frames`, `wait_idle`, `get_logs`, `rebuild`, and `close`.",
+                "RustSight lets you launch, see (via PNG screenshots, GIF frame bursts, and UI Automation trees), and control any native GUI application. \
+                 Call `launch` with a Cargo project directory or binary path first, then inspect with `get_ui_tree`/`find_element` or `screenshot`, and interact using `click_element`, `click`, `hover`, `focus`, `resize_window`, `type_text`, `press_key`, `scroll`, `drag`, `capture_frames`, `wait_idle`, `get_logs`, `rebuild`, and `close`.",
             )
     }
+}
+
+fn validate_resize_dims(width: u32, height: u32) -> AppResult<()> {
+    if !(100..=8000).contains(&width) || !(100..=8000).contains(&height) {
+        return Err(RustSightError::InputFailed(format!(
+            "Invalid resize dimensions {width}x{height}: width and height must each be between 100 and 8000 pixels."
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_click_element_target(
+    matches: &[&FlatUiElement],
+    index: Option<usize>,
+) -> AppResult<FlatUiElement> {
+    if matches.is_empty() {
+        return Err(RustSightError::InputFailed(
+            "No matching UI elements found. Call `get_ui_tree` or `find_element` to inspect available elements.".to_string(),
+        ));
+    }
+    if let Some(idx) = index {
+        return matches.get(idx).map(|el| (*el).clone()).ok_or_else(|| {
+            RustSightError::InputFailed(format!(
+                "Element match index {idx} is out of range (found {} match(es)).",
+                matches.len()
+            ))
+        });
+    }
+    if matches.len() > 1 {
+        let preview: Vec<String> = matches
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(i, el)| format!("  [{i}] {}", format_element_line(el, false)))
+            .collect();
+        return Err(RustSightError::InputFailed(format!(
+            "Multiple UI elements ({}) matched; specify `index` to disambiguate:\n{}",
+            matches.len(),
+            preview.join("\n")
+        )));
+    }
+    Ok(matches[0].clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1104,6 +1427,27 @@ mod tests {
             fn drag(&self, _: &WindowInfo, _: i32, _: i32, _: i32, _: i32) -> AppResult<()> {
                 Ok(())
             }
+            fn mouse_move(&self, _: &WindowInfo, _: i32, _: i32) -> AppResult<()> {
+                Ok(())
+            }
+            fn focus(&self, _: &WindowInfo) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        struct EmptyUiTree;
+        impl super::UiTreeBackend for EmptyUiTree {
+            fn get_ui_tree(
+                &self,
+                _window_id: WindowId,
+                _opts: super::UiTreeOptions,
+            ) -> AppResult<crate::backend::UiTreeResult> {
+                Ok(crate::backend::UiTreeResult {
+                    roots: Vec::new(),
+                    truncated_count: 0,
+                    timed_out: false,
+                })
+            }
         }
 
         let foreign_win = WindowInfo {
@@ -1125,6 +1469,7 @@ mod tests {
             restricted_cfg,
             Box::new(MockCapture(foreign_win.clone())),
             Box::new(NoopInput),
+            Box::new(EmptyUiTree),
         );
         let err = restricted.close_window_checked(Some(9999)).unwrap_err();
         assert!(matches!(err, RustSightError::WindowNotAllowed { .. }));
@@ -1134,6 +1479,7 @@ mod tests {
             attach_cfg,
             Box::new(MockCapture(foreign_win)),
             Box::new(NoopInput),
+            Box::new(EmptyUiTree),
         );
         assert_eq!(allowed.close_window_checked(Some(9999)).unwrap(), 9999);
     }
@@ -1263,6 +1609,27 @@ mod tests {
             fn drag(&self, _: &WindowInfo, _: i32, _: i32, _: i32, _: i32) -> AppResult<()> {
                 Ok(())
             }
+            fn mouse_move(&self, _: &WindowInfo, _: i32, _: i32) -> AppResult<()> {
+                Ok(())
+            }
+            fn focus(&self, _: &WindowInfo) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        struct EmptyUiTree;
+        impl super::UiTreeBackend for EmptyUiTree {
+            fn get_ui_tree(
+                &self,
+                _window_id: WindowId,
+                _opts: super::UiTreeOptions,
+            ) -> AppResult<crate::backend::UiTreeResult> {
+                Ok(crate::backend::UiTreeResult {
+                    roots: Vec::new(),
+                    truncated_count: 0,
+                    timed_out: false,
+                })
+            }
         }
 
         let cfg = Config::parse_from(["rustsight", "--allow-attach"]);
@@ -1270,6 +1637,7 @@ mod tests {
             cfg,
             Box::new(ChangingCapture(AtomicU8::new(0))),
             Box::new(NoopInput),
+            Box::new(EmptyUiTree),
         );
         let (info, _img, _elapsed, settled) = server
             .run_wait_idle(Some(777), 80, 0.001)
@@ -1277,5 +1645,50 @@ mod tests {
         assert_eq!(info.id, 777);
         assert!(!settled);
         assert!(server.run_wait_idle(Some(777), 80, 1.5).is_err());
+        // Hover bounds check uses resolve_image_coords
+        assert!(server.resolve_image_coords(&info, -1, 0).is_err());
+        assert!(server.resolve_image_coords(&info, 2, 2).is_ok());
+    }
+
+    #[test]
+    fn click_element_ambiguity_and_index_selection() {
+        let e0 = super::FlatUiElement {
+            id: 0,
+            depth: 1,
+            role: "Button".into(),
+            name: "Save".into(),
+            automation_id: "b0".into(),
+            is_enabled: true,
+            has_keyboard_focus: false,
+            x: 10,
+            y: 10,
+            width: 50,
+            height: 20,
+            center_x: 35,
+            center_y: 20,
+        };
+        let mut e1 = e0.clone();
+        e1.id = 1;
+        e1.automation_id = "b1".into();
+        e1.center_x = 100;
+
+        let empty: Vec<&super::FlatUiElement> = Vec::new();
+        assert!(super::resolve_click_element_target(&empty, None).is_err());
+
+        let two = vec![&e0, &e1];
+        let amb_err = super::resolve_click_element_target(&two, None).unwrap_err();
+        assert!(amb_err.to_string().contains("Multiple UI elements (2)"));
+
+        let picked = super::resolve_click_element_target(&two, Some(1)).unwrap();
+        assert_eq!(picked.automation_id, "b1");
+        assert!(super::resolve_click_element_target(&two, Some(5)).is_err());
+    }
+
+    #[test]
+    fn resize_window_validates_bounds() {
+        assert!(super::validate_resize_dims(99, 600).is_err());
+        assert!(super::validate_resize_dims(800, 8001).is_err());
+        assert!(super::validate_resize_dims(100, 100).is_ok());
+        assert!(super::validate_resize_dims(1920, 1080).is_ok());
     }
 }

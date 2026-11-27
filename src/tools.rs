@@ -160,3 +160,76 @@ pub struct GetLogsParams {
     #[serde(default)]
     pub clear: bool,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetUiTreeParams {
+    /// Target window ID. Defaults to the currently active launched window.
+    pub window_id: Option<WindowId>,
+    /// Maximum traversal depth (default: 6).
+    pub max_depth: Option<usize>,
+    /// Maximum number of nodes to return (default: 300).
+    pub max_nodes: Option<usize>,
+    /// Whether to include offscreen elements (default: false).
+    #[serde(default)]
+    pub include_offscreen: bool,
+    /// Whether to also attach a fresh PNG screenshot (default: false).
+    #[serde(default)]
+    pub include_screenshot: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindElementParams {
+    /// Case-insensitive substring to match against the element's accessible name.
+    pub name: Option<String>,
+    /// Exact UI Automation role / control type (e.g., "Button", "Edit", "MenuItem", "Text").
+    pub role: Option<String>,
+    /// Exact UI Automation ID (`automation_id`).
+    pub automation_id: Option<String>,
+    /// Target window ID. Defaults to the currently active launched window.
+    pub window_id: Option<WindowId>,
+    /// Maximum number of matching elements to return (default: 20).
+    pub max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClickElementParams {
+    /// Case-insensitive substring to match against the element's accessible name.
+    pub name: Option<String>,
+    /// Exact UI Automation role / control type (e.g., "Button", "Edit", "MenuItem").
+    pub role: Option<String>,
+    /// Exact UI Automation ID (`automation_id`).
+    pub automation_id: Option<String>,
+    /// Zero-based index when multiple elements match. Required if more than one element matches.
+    pub index: Option<usize>,
+    /// Mouse button: "left" (default), "right", or "middle".
+    pub button: Option<String>,
+    /// Whether to perform a double-click (default: false).
+    #[serde(default)]
+    pub double: bool,
+    /// Target window ID. Defaults to the currently active launched window.
+    pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after clicking (default: true).
+    pub include_screenshot: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HoverParams {
+    /// X coordinate in pixels of the most recent full-window screenshot.
+    pub x: i32,
+    /// Y coordinate in pixels of the most recent full-window screenshot.
+    pub y: i32,
+    /// Optional target window ID. Defaults to the active window.
+    pub window_id: Option<WindowId>,
+    /// Whether to return a fresh screenshot after moving the cursor (default: true).
+    pub include_screenshot: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResizeWindowParams {
+    /// New client width in pixels (100 to 8000).
+    pub width: u32,
+    /// New client height in pixels (100 to 8000).
+    pub height: u32,
+    /// Optional target window ID. Defaults to the active window.
+    pub window_id: Option<WindowId>,
+}

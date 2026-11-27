@@ -247,6 +247,27 @@ impl InputBackend for WindowsInputBackend {
         )])?;
         Ok(())
     }
+
+    fn mouse_move(&self, window: &WindowInfo, x: i32, y: i32) -> Result<()> {
+        if !focus_or_fallback(window, || post_move_fallback(window, x, y))? {
+            return Ok(());
+        }
+        let (nx, ny) = to_virtual_desktop_coords(window, x, y);
+        let move_evt = mouse_input(
+            nx,
+            ny,
+            0,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        );
+        if send_inputs(&[move_evt]).is_err() {
+            return post_move_fallback(window, x, y);
+        }
+        Ok(())
+    }
+
+    fn focus(&self, window: &WindowInfo) -> Result<()> {
+        focus_hwnd(window)
+    }
 }
 
 const MAX_FOCUS_WAIT: Duration = Duration::from_millis(250);
@@ -509,6 +530,17 @@ fn to_client_coords(hwnd: HWND, window: &WindowInfo, x: i32, y: i32) -> (i32, i3
         let _ = ScreenToClient(hwnd, &mut pt);
     }
     (pt.x, pt.y)
+}
+
+fn post_move_fallback(window: &WindowInfo, x: i32, y: i32) -> Result<()> {
+    let hwnd = HWND(window.id as *mut c_void);
+    let (cx, cy) = to_client_coords(hwnd, window, x, y);
+    let lparam = make_lparam(cx, cy);
+    unsafe {
+        PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), lparam)
+            .map_err(|e| RustSightError::InputFailed(format!("PostMessageW WM_MOUSEMOVE: {e}")))?;
+    }
+    Ok(())
 }
 
 fn post_click_fallback(
