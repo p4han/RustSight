@@ -396,30 +396,9 @@ impl RustSightServer {
                     .max_frames
                     .unwrap_or(this.config.default_max_frames)
                     .clamp(1, 12);
-                let interval = Duration::from_secs_f64(1.0 / fps as f64);
-
-                let start = Instant::now();
-                let end = start + Duration::from_millis(duration_ms);
-                let mut frames: Vec<CapturedFrame> = Vec::new();
-
-                while Instant::now() < end {
-                    let tick_start = Instant::now();
-                    if let Ok(frame) = this.capture.capture_window(info.id) {
-                        frames.push(frame);
-                    }
-                    let elapsed = tick_start.elapsed();
-                    if elapsed < interval {
-                        let remaining =
-                            (end.saturating_duration_since(Instant::now())).min(interval - elapsed);
-                        if !remaining.is_zero() {
-                            std::thread::sleep(remaining);
-                        }
-                    }
-                }
-
-                if frames.is_empty() {
-                    frames.push(this.capture.capture_window(info.id)?);
-                }
+                let frames =
+                    this.capture
+                        .capture_burst(info.id, Duration::from_millis(duration_ms), fps)?;
 
                 let total_captured = frames.len();
                 let ts = SystemTime::now()
@@ -715,16 +694,22 @@ impl RustSightServer {
 
                 let mut prev = this.capture.capture_window(info.id)?;
                 loop {
-                    std::thread::sleep(Duration::from_millis(120));
-                    let curr = this.capture.capture_window(info.id)?;
-                    if !frames_differ(&prev, &curr, 0.001) {
-                        let img = this.encode_frame(curr)?;
-                        return Ok((info, img, start.elapsed().as_millis()));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(RustSightError::IdleTimeout(timeout_ms));
+                    }
+                    let chunk = remaining.min(Duration::from_millis(240));
+                    let burst = this.capture.capture_burst(info.id, chunk, 8)?;
+                    for curr in burst {
+                        if !frames_differ(&prev, &curr, 0.001) {
+                            let img = this.encode_frame(curr)?;
+                            return Ok((info, img, start.elapsed().as_millis()));
+                        }
+                        prev = curr;
                     }
                     if Instant::now() >= deadline {
                         return Err(RustSightError::IdleTimeout(timeout_ms));
                     }
-                    prev = curr;
                 }
             })
             .await;

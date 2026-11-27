@@ -1,10 +1,16 @@
-use crate::backend::{CapturedFrame, WindowCaptureBackend, WindowId, WindowInfo, WindowRect};
+use crate::backend::{
+    CapturedFrame, WindowCaptureBackend, WindowId, WindowInfo, WindowRect, burst_frame_interval,
+    default_capture_burst,
+};
 use crate::error::{Result, RustSightError};
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT};
@@ -17,7 +23,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_UNSUPPORTED, IDXGIDevice};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_UNSUPPORTED, IDXGIDevice,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
@@ -39,11 +48,129 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface};
 
-pub struct WindowsCaptureBackend;
+struct CachedStaging {
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    texture: ID3D11Texture2D,
+}
+
+struct CachedD3d {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    winrt_device: IDirect3DDevice,
+    staging: Option<CachedStaging>,
+}
+
+// We protect `CachedD3d` (including `ID3D11DeviceContext` and the cached staging texture)
+// with a `std::sync::Mutex` rather than `ID3D11Multithread` because `CopyResource` + `Map`/`Unmap`
+// + staging texture reuse must execute atomically per frame without another thread mutating or
+// unmapping the shared staging texture concurrently.
+unsafe impl Send for CachedD3d {}
+unsafe impl Sync for CachedD3d {}
+
+impl CachedD3d {
+    fn new() -> Result<Self> {
+        let (device, context) = create_d3d11_device()?;
+        let dxgi_device: IDXGIDevice = device
+            .cast()
+            .map_err(|e| RustSightError::CaptureFailed(format!("IDXGIDevice cast: {e}")))?;
+        let inspectable = unsafe {
+            CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device).map_err(|e| {
+                RustSightError::CaptureFailed(format!("CreateDirect3D11DeviceFromDXGIDevice: {e}"))
+            })?
+        };
+        let winrt_device: IDirect3DDevice = inspectable
+            .cast()
+            .map_err(|e| RustSightError::CaptureFailed(format!("IDirect3DDevice cast: {e}")))?;
+
+        Ok(Self {
+            device,
+            context,
+            winrt_device,
+            staging: None,
+        })
+    }
+
+    fn staging_for(
+        &mut self,
+        src_desc: &D3D11_TEXTURE2D_DESC,
+    ) -> std::result::Result<ID3D11Texture2D, WgcAttemptError> {
+        if let Some(ref st) = self.staging
+            && st.width == src_desc.Width
+            && st.height == src_desc.Height
+            && st.format == src_desc.Format
+        {
+            return Ok(st.texture.clone());
+        }
+
+        let mut desc = *src_desc;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+
+        let mut staging = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .map_err(|e| classify_d3d_err(&self.device, "CreateTexture2D staging", e))?;
+        }
+        let texture = staging.ok_or_else(|| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(
+                "Missing staging texture".into(),
+            ))
+        })?;
+        self.staging = Some(CachedStaging {
+            width: src_desc.Width,
+            height: src_desc.Height,
+            format: src_desc.Format,
+            texture: texture.clone(),
+        });
+        Ok(texture)
+    }
+}
+
+pub struct WindowsCaptureBackend {
+    cache: Mutex<Option<CachedD3d>>,
+}
 
 impl WindowsCaptureBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            cache: Mutex::new(None),
+        }
+    }
+
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, Option<CachedD3d>> {
+        self.cache.lock().unwrap_or_else(|poisoned| {
+            warn!("D3D11 capture cache mutex was poisoned; recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    fn run_with_d3d<T, F>(&self, mut op: F) -> Result<T>
+    where
+        F: FnMut(&mut CachedD3d) -> std::result::Result<T, WgcAttemptError>,
+    {
+        for attempt in 0..2 {
+            let mut guard = self.lock_cache();
+            if guard.is_none() {
+                *guard = Some(CachedD3d::new()?);
+            }
+            let cached = guard.as_mut().expect("cache initialized");
+            match op(cached) {
+                Ok(val) => return Ok(val),
+                Err(WgcAttemptError::DeviceLost(err)) if attempt == 0 => {
+                    warn!("D3D11 device lost ({err}); dropping cached device and retrying once");
+                    *guard = None;
+                }
+                Err(WgcAttemptError::DeviceLost(err)) | Err(WgcAttemptError::Other(err)) => {
+                    return Err(err);
+                }
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -170,8 +297,9 @@ impl WindowCaptureBackend for WindowsCaptureBackend {
     }
 
     fn capture_window(&self, window_id: WindowId) -> Result<CapturedFrame> {
+        let start = Instant::now();
         let hwnd = hwnd_from_id(window_id)?;
-        match capture_with_wgc(hwnd) {
+        let res = match self.run_with_d3d(|cached| capture_with_wgc(hwnd, cached)) {
             Ok(frame) => Ok(frame),
             Err(wgc_err) => {
                 debug!("WGC capture failed ({wgc_err}), falling back to PrintWindow");
@@ -181,7 +309,45 @@ impl WindowCaptureBackend for WindowsCaptureBackend {
                     ))
                 })
             }
+        };
+        debug!(
+            "capture_window(window_id={}) took {:.2} ms",
+            window_id,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        res
+    }
+
+    fn capture_burst(
+        &self,
+        window_id: WindowId,
+        duration: Duration,
+        fps: u32,
+    ) -> Result<Vec<CapturedFrame>> {
+        let start = Instant::now();
+        let hwnd = hwnd_from_id(window_id)?;
+        let res = match self.run_with_d3d(|cached| capture_burst_wgc(hwnd, cached, duration, fps)) {
+            Ok(frames) if !frames.is_empty() => Ok(frames),
+            Ok(_) => {
+                debug!("WGC burst delivered 0 frames (static window), falling back to PrintWindow");
+                default_capture_burst(self, window_id, duration, fps)
+            }
+            Err(e) => {
+                debug!("WGC burst failed ({e}), falling back to per-frame capture loop");
+                default_capture_burst(self, window_id, duration, fps)
+            }
+        };
+        if let Ok(ref frames) = res {
+            let secs = start.elapsed().as_secs_f64().max(1e-6);
+            debug!(
+                "capture_burst(window_id={}) captured {} frames in {:.2} ms ({:.1} fps)",
+                window_id,
+                frames.len(),
+                secs * 1000.0,
+                frames.len() as f64 / secs
+            );
         }
+        res
     }
 
     fn resize_window(&self, window_id: WindowId, width: u32, height: u32) -> Result<()> {
@@ -338,116 +504,121 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     }
 }
 
-fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
-    unsafe {
-        if IsIconic(hwnd).as_bool() {
-            return Err(RustSightError::CaptureFailed(
-                "Window is minimized".to_string(),
-            ));
+enum WgcAttemptError {
+    DeviceLost(RustSightError),
+    Other(RustSightError),
+}
+
+fn is_device_lost_error(err: &windows::core::Error) -> bool {
+    let code = err.code();
+    code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET
+}
+
+fn classify_d3d_err(
+    device: &ID3D11Device,
+    context: &str,
+    err: windows::core::Error,
+) -> WgcAttemptError {
+    let lost = is_device_lost_error(&err) || unsafe { device.GetDeviceRemovedReason().is_err() };
+    let wrapped = RustSightError::CaptureFailed(format!("{context}: {err}"));
+    if lost {
+        WgcAttemptError::DeviceLost(wrapped)
+    } else {
+        WgcAttemptError::Other(wrapped)
+    }
+}
+
+struct WgcPoolGuard(Option<Direct3D11CaptureFramePool>);
+impl Drop for WgcPoolGuard {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            let _ = pool.Close();
         }
+    }
+}
 
-        let (d3d_device, d3d_context) = create_d3d11_device()?;
-        let dxgi_device: IDXGIDevice = d3d_device
-            .cast()
-            .map_err(|e| RustSightError::CaptureFailed(format!("IDXGIDevice cast: {e}")))?;
+struct WgcSessionGuard(Option<GraphicsCaptureSession>);
+impl Drop for WgcSessionGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            let _ = session.Close();
+        }
+    }
+}
 
-        let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device).map_err(|e| {
-            RustSightError::CaptureFailed(format!("CreateDirect3D11DeviceFromDXGIDevice: {e}"))
-        })?;
-        let winrt_device: IDirect3DDevice = inspectable
-            .cast()
-            .map_err(|e| RustSightError::CaptureFailed(format!("IDirect3DDevice cast: {e}")))?;
+struct MappedGuard<'a> {
+    context: &'a ID3D11DeviceContext,
+    resource: &'a ID3D11Resource,
+}
+impl Drop for MappedGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.context.Unmap(self.resource, 0);
+        }
+    }
+}
 
+fn create_capture_item(hwnd: HWND) -> std::result::Result<GraphicsCaptureItem, WgcAttemptError> {
+    unsafe {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(|e| {
-                RustSightError::CaptureFailed(format!("IGraphicsCaptureItemInterop: {e}"))
+                WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                    "IGraphicsCaptureItemInterop: {e}"
+                )))
             })?;
-        let item: GraphicsCaptureItem = interop
-            .CreateForWindow(hwnd)
-            .map_err(|e| RustSightError::CaptureFailed(format!("CreateForWindow: {e}")))?;
+        interop.CreateForWindow(hwnd).map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "CreateForWindow: {e}"
+            )))
+        })
+    }
+}
 
-        let size = item
-            .Size()
-            .map_err(|e| RustSightError::CaptureFailed(format!("item.Size: {e}")))?;
-        if size.Width <= 0 || size.Height <= 0 {
-            return Err(RustSightError::CaptureFailed(
-                "Window has zero capture size".to_string(),
-            ));
-        }
-
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &winrt_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            1,
-            size,
-        )
-        .map_err(|e| RustSightError::CaptureFailed(format!("Direct3D11CaptureFramePool: {e}")))?;
-
-        let session = pool
-            .CreateCaptureSession(&item)
-            .map_err(|e| RustSightError::CaptureFailed(format!("CreateCaptureSession: {e}")))?;
-
-        // Best-effort: hide yellow capture border & cursor if supported on this Windows version
-        let _ = session.SetIsBorderRequired(false);
-        let _ = session.SetIsCursorCaptureEnabled(false);
-
-        session
-            .StartCapture()
-            .map_err(|e| RustSightError::CaptureFailed(format!("StartCapture: {e}")))?;
-
-        let deadline = Instant::now() + Duration::from_millis(1200);
-        let frame = loop {
-            match pool.TryGetNextFrame() {
-                Ok(f) => break f,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => {
-                    let _ = session.Close();
-                    let _ = pool.Close();
-                    return Err(RustSightError::CaptureFailed(format!(
-                        "Timed out waiting for WGC frame: {e}"
-                    )));
-                }
-            }
-        };
-
-        let surface = frame
-            .Surface()
-            .map_err(|e| RustSightError::CaptureFailed(format!("frame.Surface: {e}")))?;
+fn extract_wgc_frame(
+    hwnd: HWND,
+    cached: &mut CachedD3d,
+    frame: &Direct3D11CaptureFrame,
+) -> std::result::Result<CapturedFrame, WgcAttemptError> {
+    unsafe {
+        let surface = frame.Surface().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!("frame.Surface: {e}")))
+        })?;
         let access: IDirect3DDxgiInterfaceAccess = surface.cast().map_err(|e| {
-            RustSightError::CaptureFailed(format!("IDirect3DDxgiInterfaceAccess: {e}"))
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "IDirect3DDxgiInterfaceAccess: {e}"
+            )))
         })?;
         let texture: ID3D11Texture2D = access.GetInterface().map_err(|e| {
-            RustSightError::CaptureFailed(format!("GetInterface<ID3D11Texture2D>: {e}"))
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "GetInterface<ID3D11Texture2D>: {e}"
+            )))
         })?;
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-        desc.MiscFlags = 0;
+        let staging = cached.staging_for(&desc)?;
 
-        let mut staging = None;
-        d3d_device
-            .CreateTexture2D(&desc, None, Some(&mut staging))
-            .map_err(|e| RustSightError::CaptureFailed(format!("CreateTexture2D staging: {e}")))?;
-        let staging = staging
-            .ok_or_else(|| RustSightError::CaptureFailed("Missing staging texture".into()))?;
-
-        let src_res: ID3D11Resource = texture
-            .cast()
-            .map_err(|e| RustSightError::CaptureFailed(format!("src resource cast: {e}")))?;
-        let dst_res: ID3D11Resource = staging
-            .cast()
-            .map_err(|e| RustSightError::CaptureFailed(format!("dst resource cast: {e}")))?;
-        d3d_context.CopyResource(&dst_res, &src_res);
+        let src_res: ID3D11Resource = texture.cast().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "src resource cast: {e}"
+            )))
+        })?;
+        let dst_res: ID3D11Resource = staging.cast().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "dst resource cast: {e}"
+            )))
+        })?;
+        cached.context.CopyResource(&dst_res, &src_res);
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        d3d_context
+        cached
+            .context
             .Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .map_err(|e| RustSightError::CaptureFailed(format!("Map staging texture: {e}")))?;
+            .map_err(|e| classify_d3d_err(&cached.device, "Map staging texture", e))?;
+        let _mapped_guard = MappedGuard {
+            context: &cached.context,
+            resource: &dst_res,
+        };
 
         let tex_w = desc.Width;
         let tex_h = desc.Height;
@@ -498,15 +669,207 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
             }
         }
 
-        d3d_context.Unmap(&dst_res, 0);
-        let _ = session.Close();
-        let _ = pool.Close();
-
         Ok(CapturedFrame {
             width: crop_w,
             height: crop_h,
             rgba,
         })
+    }
+}
+
+fn capture_with_wgc(
+    hwnd: HWND,
+    cached: &mut CachedD3d,
+) -> std::result::Result<CapturedFrame, WgcAttemptError> {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            return Err(WgcAttemptError::Other(RustSightError::CaptureFailed(
+                "Window is minimized".to_string(),
+            )));
+        }
+
+        let item = create_capture_item(hwnd)?;
+        let size = item.Size().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!("item.Size: {e}")))
+        })?;
+        if size.Width <= 0 || size.Height <= 0 {
+            return Err(WgcAttemptError::Other(RustSightError::CaptureFailed(
+                "Window has zero capture size".to_string(),
+            )));
+        }
+
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &cached.winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            1,
+            size,
+        )
+        .map_err(|e| classify_d3d_err(&cached.device, "Direct3D11CaptureFramePool", e))?;
+        let _pool_guard = WgcPoolGuard(Some(pool.clone()));
+
+        let session = pool.CreateCaptureSession(&item).map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "CreateCaptureSession: {e}"
+            )))
+        })?;
+        let _session_guard = WgcSessionGuard(Some(session.clone()));
+
+        let _ = session.SetIsBorderRequired(false);
+        let _ = session.SetIsCursorCaptureEnabled(false);
+
+        session.StartCapture().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!("StartCapture: {e}")))
+        })?;
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let frame = loop {
+            match pool.TryGetNextFrame() {
+                Ok(f) => break f,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => {
+                    return Err(WgcAttemptError::Other(RustSightError::CaptureFailed(
+                        format!("Timed out waiting for WGC frame: {e}"),
+                    )));
+                }
+            }
+        };
+
+        extract_wgc_frame(hwnd, cached, &frame)
+    }
+}
+
+fn capture_burst_wgc(
+    hwnd: HWND,
+    cached: &mut CachedD3d,
+    duration: Duration,
+    fps: u32,
+) -> std::result::Result<Vec<CapturedFrame>, WgcAttemptError> {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            return Err(WgcAttemptError::Other(RustSightError::CaptureFailed(
+                "Window is minimized".to_string(),
+            )));
+        }
+
+        let item = create_capture_item(hwnd)?;
+        let mut current_size = item.Size().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!("item.Size: {e}")))
+        })?;
+        if current_size.Width <= 0 || current_size.Height <= 0 {
+            return Err(WgcAttemptError::Other(RustSightError::CaptureFailed(
+                "Window has zero capture size".to_string(),
+            )));
+        }
+
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &cached.winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            current_size,
+        )
+        .map_err(|e| classify_d3d_err(&cached.device, "Direct3D11CaptureFramePool", e))?;
+        let _pool_guard = WgcPoolGuard(Some(pool.clone()));
+
+        let session = pool.CreateCaptureSession(&item).map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!(
+                "CreateCaptureSession: {e}"
+            )))
+        })?;
+        let _session_guard = WgcSessionGuard(Some(session.clone()));
+
+        let _ = session.SetIsBorderRequired(false);
+        let _ = session.SetIsCursorCaptureEnabled(false);
+
+        session.StartCapture().map_err(|e| {
+            WgcAttemptError::Other(RustSightError::CaptureFailed(format!("StartCapture: {e}")))
+        })?;
+
+        let interval = burst_frame_interval(fps);
+        let start = Instant::now();
+        let end = start + duration;
+        let mut frames = Vec::new();
+        let mut last_frame: Option<CapturedFrame> = None;
+
+        while Instant::now() < end || frames.is_empty() {
+            let tick_start = Instant::now();
+
+            // Recreate the pool if the window was resized mid-burst.
+            if let Ok(new_size) = item.Size()
+                && new_size.Width > 0
+                && new_size.Height > 0
+                && (new_size.Width != current_size.Width || new_size.Height != current_size.Height)
+            {
+                let _ = pool.Recreate(
+                    &cached.winrt_device,
+                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    2,
+                    new_size,
+                );
+                current_size = new_size;
+            }
+
+            let mut latest: Option<Direct3D11CaptureFrame> = None;
+            while let Ok(f) = pool.TryGetNextFrame() {
+                latest = Some(f);
+            }
+
+            // On the very first tick, wait briefly for WGC to deliver an initial frame.
+            if latest.is_none() && last_frame.is_none() {
+                let first_wait_end =
+                    (Instant::now() + Duration::from_millis(120)).min(end.max(Instant::now()));
+                while Instant::now() < first_wait_end {
+                    if let Ok(f) = pool.TryGetNextFrame() {
+                        latest = Some(f);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+
+            if let Some(wgc_frame) = latest {
+                if let Ok(content_size) = wgc_frame.ContentSize()
+                    && content_size.Width > 0
+                    && content_size.Height > 0
+                    && (content_size.Width != current_size.Width
+                        || content_size.Height != current_size.Height)
+                {
+                    let _ = pool.Recreate(
+                        &cached.winrt_device,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        content_size,
+                    );
+                    current_size = content_size;
+                }
+                let captured = extract_wgc_frame(hwnd, cached, &wgc_frame)?;
+                last_frame = Some(captured.clone());
+                frames.push(captured);
+            } else if let Some(ref prev) = last_frame {
+                // Static window: reuse previous frame so the burst keeps its timing.
+                frames.push(prev.clone());
+            } else {
+                // Static window delivered no initial WGC frame; let caller fall back to PrintWindow.
+                break;
+            }
+
+            if Instant::now() >= end {
+                break;
+            }
+
+            let elapsed = tick_start.elapsed();
+            if elapsed < interval {
+                let remaining = end
+                    .saturating_duration_since(Instant::now())
+                    .min(interval - elapsed);
+                if !remaining.is_zero() {
+                    std::thread::sleep(remaining);
+                }
+            }
+        }
+
+        Ok(frames)
     }
 }
 
@@ -576,5 +939,64 @@ fn capture_with_print_window(hwnd: HWND) -> Result<CapturedFrame> {
             height: bounds.height,
             rgba,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_d3d_device_is_created_once_and_reused() {
+        let backend = WindowsCaptureBackend::new();
+        let _ = backend.init();
+        let ptr1 = backend
+            .run_with_d3d(|cached| Ok(cached.device.as_raw() as usize))
+            .expect("first d3d device");
+        let ptr2 = backend
+            .run_with_d3d(|cached| Ok(cached.device.as_raw() as usize))
+            .expect("reused d3d device");
+        assert_eq!(ptr1, ptr2);
+    }
+
+    #[test]
+    #[ignore = "Requires a live desktop window; run manually to benchmark capture speed"]
+    fn benchmark_live_window_capture() {
+        let backend = WindowsCaptureBackend::new();
+        let _ = backend.init();
+        let windows = backend.list_windows().expect("list_windows");
+        let win = windows
+            .into_iter()
+            .next()
+            .expect("at least one visible window");
+
+        // Warm up cached device
+        let _ = backend.capture_window(win.id).expect("warmup");
+
+        let mut single_times = Vec::new();
+        for _ in 0..10 {
+            let t = Instant::now();
+            let _ = backend.capture_window(win.id).expect("single capture");
+            single_times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let avg_ms = single_times.iter().sum::<f64>() / single_times.len() as f64;
+
+        let burst_start = Instant::now();
+        let burst = backend
+            .capture_burst(win.id, Duration::from_secs(2), 30)
+            .expect("2s 30fps burst");
+        let burst_secs = burst_start.elapsed().as_secs_f64();
+        let achieved_fps = burst.len() as f64 / burst_secs;
+
+        println!(
+            "WINDOW `{}` ({}x{}): avg_single={:.2} ms, burst_2s_30fps={} frames in {:.2} s ({:.1} fps)",
+            win.title,
+            win.rect.width,
+            win.rect.height,
+            avg_ms,
+            burst.len(),
+            burst_secs,
+            achieved_fps
+        );
     }
 }

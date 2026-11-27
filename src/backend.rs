@@ -1,5 +1,6 @@
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// Opaque platform window identifier (e.g., HWND cast to u64 on Windows).
 pub type WindowId = u64;
@@ -78,6 +79,11 @@ impl Modifiers {
     }
 }
 
+/// Compute the per-frame interval for a burst capture at `fps` (clamped to `[1, 60]`).
+pub fn burst_frame_interval(fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / fps.clamp(1, 60) as f64)
+}
+
 /// Platform-agnostic window capture & inspection backend.
 pub trait WindowCaptureBackend: Send + Sync {
     /// Initialize platform-specific state (e.g., DPI awareness).
@@ -99,12 +105,57 @@ pub trait WindowCaptureBackend: Send + Sync {
     /// Capture the window's pixels as an RGBA8 frame.
     fn capture_window(&self, window_id: WindowId) -> Result<CapturedFrame>;
 
+    /// Burst-capture frames over `duration` at target `fps`.
+    /// Default implementation loops `capture_window` at the requested interval.
+    fn capture_burst(
+        &self,
+        window_id: WindowId,
+        duration: Duration,
+        fps: u32,
+    ) -> Result<Vec<CapturedFrame>> {
+        default_capture_burst(self, window_id, duration, fps)
+    }
+
     /// Resize the window's client/outer size.
     fn resize_window(&self, window_id: WindowId, width: u32, height: u32) -> Result<()>;
 
     /// Bring the window to the foreground / focus it for input.
     #[allow(dead_code)]
     fn focus_window(&self, window_id: WindowId) -> Result<()>;
+}
+
+/// Shared default burst-capture loop used by mock/fallback backends.
+pub fn default_capture_burst<B: WindowCaptureBackend + ?Sized>(
+    backend: &B,
+    window_id: WindowId,
+    duration: Duration,
+    fps: u32,
+) -> Result<Vec<CapturedFrame>> {
+    let interval = burst_frame_interval(fps);
+    let start = Instant::now();
+    let end = start + duration;
+    let mut frames = Vec::new();
+
+    while Instant::now() < end {
+        let tick_start = Instant::now();
+        if let Ok(frame) = backend.capture_window(window_id) {
+            frames.push(frame);
+        }
+        let elapsed = tick_start.elapsed();
+        if elapsed < interval {
+            let remaining = end
+                .saturating_duration_since(Instant::now())
+                .min(interval - elapsed);
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
+        }
+    }
+
+    if frames.is_empty() {
+        frames.push(backend.capture_window(window_id)?);
+    }
+    Ok(frames)
 }
 
 /// Platform-agnostic input injection backend.
@@ -133,4 +184,75 @@ pub trait InputBackend: Send + Sync {
         to_x: i32,
         to_y: i32,
     ) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockBurstBackend;
+    impl WindowCaptureBackend for MockBurstBackend {
+        fn init(&self) -> Result<()> {
+            Ok(())
+        }
+        fn find_window_by_pid(&self, _pid: u32) -> Result<Option<WindowInfo>> {
+            Ok(None)
+        }
+        fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_window_info(&self, window_id: WindowId) -> Result<WindowInfo> {
+            Ok(WindowInfo {
+                id: window_id,
+                pid: 0,
+                title: "Mock".into(),
+                rect: WindowRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                dpi_scale: 1.0,
+                is_minimized: false,
+            })
+        }
+        fn is_window_alive(&self, _window_id: WindowId) -> bool {
+            true
+        }
+        fn capture_window(&self, _window_id: WindowId) -> Result<CapturedFrame> {
+            Ok(CapturedFrame {
+                width: 4,
+                height: 4,
+                rgba: vec![255; 4 * 4 * 4],
+            })
+        }
+        fn resize_window(&self, _window_id: WindowId, _width: u32, _height: u32) -> Result<()> {
+            Ok(())
+        }
+        fn focus_window(&self, _window_id: WindowId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn burst_frame_interval_clamps_fps() {
+        assert_eq!(burst_frame_interval(0), Duration::from_secs(1));
+        assert_eq!(burst_frame_interval(10), Duration::from_millis(100));
+        assert_eq!(
+            burst_frame_interval(1000),
+            Duration::from_secs_f64(1.0 / 60.0)
+        );
+    }
+
+    #[test]
+    fn default_capture_burst_returns_frames_for_duration() {
+        let backend = MockBurstBackend;
+        let start = Instant::now();
+        let frames = backend
+            .capture_burst(1, Duration::from_millis(120), 20)
+            .expect("default burst");
+        let elapsed = start.elapsed();
+        assert!(!frames.is_empty());
+        assert!(elapsed >= Duration::from_millis(90));
+    }
 }

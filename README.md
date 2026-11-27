@@ -112,7 +112,7 @@ By default, RustSight restricts all vision and input tools (`list_windows`, `scr
 ![RustSight Architecture](docs/architecture.png)
 
 - `src/backend.rs` — Platform-agnostic `WindowCaptureBackend` and `InputBackend` traits (ready for macOS/Linux backends).
-- `src/capture/` — Windows Graphics Capture API + `PrintWindow` fallback, PNG/GIF encoding, and frame diffing.
+- `src/capture/` — Windows Graphics Capture API (with cached D3D11/WinRT devices, reusable staging textures, and persistent burst capture sessions) + `PrintWindow` fallback, PNG/GIF encoding, and frame diffing.
 - `src/input/` — DPI-aware `SendInput` mouse, keyboard, scroll, and drag injection with `PostMessageW` fallback.
 - `src/process/` — Cargo builder (`--message-format=json`), executable discovery, Windows Job Object lifecycle cleanup.
 - `src/server.rs` & `src/tools.rs` — `rmcp` stdio MCP server and tool schemas.
