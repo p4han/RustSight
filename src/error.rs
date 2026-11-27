@@ -50,9 +50,6 @@ pub enum RustSightError {
     #[error("Invalid mouse button `{0}`. Expected `left`, `right`, or `middle`.")]
     InvalidMouseButton(String),
 
-    #[error("Timed out after {0} ms waiting for window to become idle.")]
-    IdleTimeout(u64),
-
     #[error("No previous launch configuration to rebuild. Call `launch` first.")]
     NothingToRebuild,
 

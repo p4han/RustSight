@@ -9,6 +9,10 @@ pub struct Config {
     #[arg(long, default_value_t = 120)]
     pub settle_ms: u64,
 
+    /// Maximum total wait time (ms) for adaptive settle after input actions before capturing.
+    #[arg(long, default_value_t = 1000)]
+    pub settle_max_ms: u64,
+
     /// Directory where animated GIF/APNG recordings are saved (defaults to OS temp dir).
     #[arg(long)]
     pub capture_dir: Option<PathBuf>,

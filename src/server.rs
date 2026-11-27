@@ -11,8 +11,8 @@ use crate::process::{
     LaunchSpec, ProcessManager, is_pid_or_descendant_tracked, prepare_launch, process_exe_name,
 };
 use crate::tools::{
-    CaptureFramesParams, ClickParams, DragParams, LaunchParams, PressKeyParams, ScreenshotParams,
-    ScrollParams, TypeTextParams, WaitIdleParams, WindowIdParams,
+    CaptureFramesParams, ClickParams, DragParams, GetLogsParams, LaunchParams, PressKeyParams,
+    ScreenshotParams, ScrollParams, TypeTextParams, WaitIdleParams, WindowIdParams,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -56,6 +56,11 @@ struct EncodedImage {
     width: u32,
     height: u32,
     scale: f64,
+}
+
+struct SettledCapture {
+    img: EncodedImage,
+    unsettled_ms: Option<u128>,
 }
 
 impl RustSightServer {
@@ -186,11 +191,92 @@ impl RustSightServer {
         ))
     }
 
-    fn settle_and_capture(&self, wid: WindowId) -> AppResult<(WindowInfo, EncodedImage)> {
-        std::thread::sleep(Duration::from_millis(self.config.settle_ms));
+    fn settle_and_capture(&self, wid: WindowId) -> AppResult<(WindowInfo, SettledCapture)> {
+        let start = Instant::now();
+        let min_settle = Duration::from_millis(self.config.settle_ms);
+        let max_settle =
+            Duration::from_millis(self.config.settle_max_ms.max(self.config.settle_ms));
+        if !min_settle.is_zero() {
+            std::thread::sleep(min_settle);
+        }
+
+        let mut prev = self.capture.capture_window(wid)?;
+        let mut unsettled_ms = None;
+
+        if start.elapsed() < max_settle {
+            loop {
+                let remaining = max_settle.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    unsettled_ms = Some(start.elapsed().as_millis());
+                    break;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(40)));
+                let curr = self.capture.capture_window(wid)?;
+                match evaluate_settle_step(&prev, &curr, start.elapsed(), max_settle, 0.001) {
+                    SettleDecision::Settled => {
+                        prev = curr;
+                        break;
+                    }
+                    SettleDecision::TimedOut => {
+                        prev = curr;
+                        unsettled_ms = Some(start.elapsed().as_millis());
+                        break;
+                    }
+                    SettleDecision::KeepWaiting => {
+                        prev = curr;
+                    }
+                }
+            }
+        }
+
         let info = self.capture.get_window_info(wid)?;
-        let img = self.capture_and_encode(wid)?;
-        Ok((info, img))
+        let img = self.encode_frame(prev)?;
+        Ok((info, SettledCapture { img, unsettled_ms }))
+    }
+
+    fn format_settle_suffix(unsettled_ms: Option<u128>) -> String {
+        match unsettled_ms {
+            Some(ms) => format!(" — UI was still changing after {ms} ms"),
+            None => String::new(),
+        }
+    }
+
+    fn run_wait_idle(
+        &self,
+        window_id: Option<WindowId>,
+        timeout_ms: u64,
+        threshold: f64,
+    ) -> AppResult<(WindowInfo, EncodedImage, u128, bool)> {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(RustSightError::InputFailed(format!(
+                "Invalid `threshold` {threshold}: expected a finite number in [0.0, 1.0]."
+            )));
+        }
+        let info = self.resolve_window(window_id)?;
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(timeout_ms);
+
+        let mut prev = self.capture.capture_window(info.id)?;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let img = self.encode_frame(prev)?;
+                return Ok((info, img, start.elapsed().as_millis(), false));
+            }
+            let chunk = remaining.min(Duration::from_millis(240));
+            let burst = self.capture.capture_burst(info.id, chunk, 8)?;
+            for curr in burst {
+                if !frames_differ(&prev, &curr, threshold) {
+                    let img = self.encode_frame(curr)?;
+                    return Ok((info, img, start.elapsed().as_millis(), true));
+                }
+                prev = curr;
+            }
+            if Instant::now() >= deadline {
+                let img = self.encode_frame(prev)?;
+                return Ok((info, img, start.elapsed().as_millis(), false));
+            }
+        }
     }
 
     fn format_image_meta(img: &EncodedImage, info: &WindowInfo) -> String {
@@ -228,6 +314,11 @@ impl RustSightServer {
                 args: params.args,
                 width: params.width.or(this.config.default_width),
                 height: params.height.or(this.config.default_height),
+                bin: params.bin,
+                package: params.package,
+                release: params.release,
+                features: params.features,
+                all_features: params.all_features,
             };
             let build_timeout = Duration::from_secs(this.config.build_timeout_secs);
             let window_timeout = Duration::from_secs(this.config.window_timeout_secs);
@@ -468,14 +559,14 @@ impl RustSightServer {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
         let res = tokio::task::spawn_blocking(
-            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
+            move || -> AppResult<(WindowInfo, Option<SettledCapture>)> {
                 let info = this.resolve_window(params.window_id)?;
                 let (sx, sy) = this.resolve_image_coords(&info, params.x, params.y)?;
                 let btn = MouseButton::parse(params.button.as_deref().unwrap_or("left"))?;
                 this.input.click(&info, sx, sy, btn, params.double)?;
                 if include {
-                    let (info, img) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(img)))
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(cap)))
                 } else {
                     Ok((info, None))
                 }
@@ -484,15 +575,16 @@ impl RustSightServer {
         .await;
 
         match res {
-            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(cap)))) => Self::ok_with_screenshot(
                 format!(
-                    "Clicked ({}, {}) on `{}` ({})",
+                    "Clicked ({}, {}) on `{}` ({}){}",
                     params.x,
                     params.y,
                     info.title,
-                    Self::format_image_meta(&img, &info)
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
                 ),
-                img,
+                cap.img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Clicked ({}, {}) on `{}`",
@@ -513,12 +605,12 @@ impl RustSightServer {
         let include = params.include_screenshot.unwrap_or(true);
         let text_len = params.text.chars().count();
         let res = tokio::task::spawn_blocking(
-            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
+            move || -> AppResult<(WindowInfo, Option<SettledCapture>)> {
                 let info = this.resolve_window(params.window_id)?;
                 this.input.type_text(&info, &params.text)?;
                 if include {
-                    let (info, img) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(img)))
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(cap)))
                 } else {
                     Ok((info, None))
                 }
@@ -527,13 +619,14 @@ impl RustSightServer {
         .await;
 
         match res {
-            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(cap)))) => Self::ok_with_screenshot(
                 format!(
-                    "Typed {text_len} chars into `{}` ({})",
+                    "Typed {text_len} chars into `{}` ({}){}",
                     info.title,
-                    Self::format_image_meta(&img, &info)
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
                 ),
-                img,
+                cap.img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Typed {text_len} chars into `{}`",
@@ -555,13 +648,13 @@ impl RustSightServer {
         let key_desc = params.key.clone();
         let mods_desc = params.modifiers.clone();
         let res = tokio::task::spawn_blocking(
-            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
+            move || -> AppResult<(WindowInfo, Option<SettledCapture>)> {
                 let info = this.resolve_window(params.window_id)?;
                 let mods = Modifiers::from_list(&params.modifiers);
                 this.input.press_key(&info, &params.key, &mods)?;
                 if include {
-                    let (info, img) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(img)))
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(cap)))
                 } else {
                     Ok((info, None))
                 }
@@ -570,13 +663,14 @@ impl RustSightServer {
         .await;
 
         match res {
-            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(cap)))) => Self::ok_with_screenshot(
                 format!(
-                    "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}` ({})",
+                    "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}` ({}){}",
                     info.title,
-                    Self::format_image_meta(&img, &info)
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
                 ),
-                img,
+                cap.img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Pressed `{key_desc}` (mods={mods_desc:?}) on `{}`",
@@ -596,13 +690,13 @@ impl RustSightServer {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
         let res = tokio::task::spawn_blocking(
-            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
+            move || -> AppResult<(WindowInfo, Option<SettledCapture>)> {
                 let info = this.resolve_window(params.window_id)?;
                 let (sx, sy) = this.resolve_image_coords(&info, params.x, params.y)?;
                 this.input.scroll(&info, sx, sy, params.dx, params.dy)?;
                 if include {
-                    let (info, img) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(img)))
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(cap)))
                 } else {
                     Ok((info, None))
                 }
@@ -611,17 +705,18 @@ impl RustSightServer {
         .await;
 
         match res {
-            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(cap)))) => Self::ok_with_screenshot(
                 format!(
-                    "Scrolled ({}, {}) at ({}, {}) on `{}` ({})",
+                    "Scrolled ({}, {}) at ({}, {}) on `{}` ({}){}",
                     params.dx,
                     params.dy,
                     params.x,
                     params.y,
                     info.title,
-                    Self::format_image_meta(&img, &info)
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
                 ),
-                img,
+                cap.img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Scrolled ({}, {}) at ({}, {}) on `{}`",
@@ -641,14 +736,14 @@ impl RustSightServer {
         let this = self.clone();
         let include = params.include_screenshot.unwrap_or(true);
         let res = tokio::task::spawn_blocking(
-            move || -> AppResult<(WindowInfo, Option<EncodedImage>)> {
+            move || -> AppResult<(WindowInfo, Option<SettledCapture>)> {
                 let info = this.resolve_window(params.window_id)?;
                 let (fx, fy) = this.resolve_image_coords(&info, params.from_x, params.from_y)?;
                 let (tx, ty) = this.resolve_image_coords(&info, params.to_x, params.to_y)?;
                 this.input.drag(&info, fx, fy, tx, ty)?;
                 if include {
-                    let (info, img) = this.settle_and_capture(info.id)?;
-                    Ok((info, Some(img)))
+                    let (info, cap) = this.settle_and_capture(info.id)?;
+                    Ok((info, Some(cap)))
                 } else {
                     Ok((info, None))
                 }
@@ -657,17 +752,18 @@ impl RustSightServer {
         .await;
 
         match res {
-            Ok(Ok((info, Some(img)))) => Self::ok_with_screenshot(
+            Ok(Ok((info, Some(cap)))) => Self::ok_with_screenshot(
                 format!(
-                    "Dragged ({}, {}) -> ({}, {}) on `{}` ({})",
+                    "Dragged ({}, {}) -> ({}, {}) on `{}` ({}){}",
                     params.from_x,
                     params.from_y,
                     params.to_x,
                     params.to_y,
                     info.title,
-                    Self::format_image_meta(&img, &info)
+                    Self::format_image_meta(&cap.img, &info),
+                    Self::format_settle_suffix(cap.unsettled_ms)
                 ),
-                img,
+                cap.img,
             ),
             Ok(Ok((info, None))) => CallToolResult::success(vec![Content::text(format!(
                 "Dragged ({}, {}) -> ({}, {}) on `{}`",
@@ -681,45 +777,30 @@ impl RustSightServer {
     /// Wait until consecutive frames of the window stop changing, then return a fresh screenshot.
     #[tool(
         name = "wait_idle",
-        description = "Wait until the window stops changing visually (compares consecutive frames) up to timeout_ms (default 5000ms), then returns a fresh PNG screenshot."
+        description = "Wait until the window stops changing visually (compares consecutive frames using optional `threshold`, default 0.001) up to timeout_ms (default 5000ms), then returns a fresh PNG screenshot. Never fails on timeout; returns the latest frame with a note if still changing."
     )]
     async fn wait_idle(&self, Parameters(params): Parameters<WaitIdleParams>) -> CallToolResult {
         let this = self.clone();
-        let res =
-            tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, EncodedImage, u128)> {
-                let info = this.resolve_window(params.window_id)?;
-                let timeout_ms = params.timeout_ms.unwrap_or(5000);
-                let start = Instant::now();
-                let deadline = start + Duration::from_millis(timeout_ms);
-
-                let mut prev = this.capture.capture_window(info.id)?;
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(RustSightError::IdleTimeout(timeout_ms));
-                    }
-                    let chunk = remaining.min(Duration::from_millis(240));
-                    let burst = this.capture.capture_burst(info.id, chunk, 8)?;
-                    for curr in burst {
-                        if !frames_differ(&prev, &curr, 0.001) {
-                            let img = this.encode_frame(curr)?;
-                            return Ok((info, img, start.elapsed().as_millis()));
-                        }
-                        prev = curr;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(RustSightError::IdleTimeout(timeout_ms));
-                    }
-                }
-            })
-            .await;
+        let timeout_ms = params.timeout_ms.unwrap_or(5000);
+        let threshold = params.threshold.unwrap_or(0.001);
+        let res = tokio::task::spawn_blocking(move || {
+            this.run_wait_idle(params.window_id, timeout_ms, threshold)
+        })
+        .await;
 
         match res {
-            Ok(Ok((info, img, elapsed))) => Self::ok_with_screenshot(
+            Ok(Ok((info, img, elapsed, true))) => Self::ok_with_screenshot(
                 format!(
                     "Window `{}` (window_id={}) settled after {elapsed} ms ({})",
                     info.title,
                     info.id,
+                    Self::format_image_meta(&img, &info)
+                ),
+                img,
+            ),
+            Ok(Ok((info, img, _elapsed, false))) => Self::ok_with_screenshot(
+                format!(
+                    "Window did not settle within {timeout_ms} ms (still changing, for example an animation or blinking caret) ({})",
                     Self::format_image_meta(&img, &info)
                 ),
                 img,
@@ -781,6 +862,40 @@ impl RustSightServer {
         }
     }
 
+    /// Read buffered stdout/stderr log lines from a launched application.
+    #[tool(
+        name = "get_logs",
+        description = "Return recent stdout/stderr log lines captured from a launched application (default last 200 lines; stderr lines are prefixed with [stderr]). Optionally pass `clear=true` to empty the buffer after reading."
+    )]
+    async fn get_logs(&self, Parameters(params): Parameters<GetLogsParams>) -> CallToolResult {
+        let this = self.clone();
+        let tail = params.tail.unwrap_or(200);
+        let clear = params.clear;
+        let res = tokio::task::spawn_blocking(move || -> AppResult<(WindowInfo, Vec<String>)> {
+            let info = this.resolve_window(params.window_id)?;
+            let pm = lock_recover(&this.processes, "ProcessManager");
+            let lines = pm.get_logs(info.id, tail, clear);
+            Ok((info, lines))
+        })
+        .await;
+
+        match res {
+            Ok(Ok((info, lines))) => {
+                let body = if lines.is_empty() {
+                    format!(
+                        "No logs captured for `{}` (window_id={}).",
+                        info.title, info.id
+                    )
+                } else {
+                    lines.join("\n")
+                };
+                CallToolResult::success(vec![Content::text(body)])
+            }
+            Ok(Err(e)) => Self::err_result(e),
+            Err(e) => Self::err_result(RustSightError::CaptureFailed(e.to_string())),
+        }
+    }
+
     /// Close the tracked application window and terminate its process.
     #[tool(
         name = "close",
@@ -810,8 +925,31 @@ impl ServerHandler for RustSightServer {
             .with_server_info(Implementation::new("rustsight", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "RustSight lets you launch, see (via PNG screenshots & GIF frame bursts), and control any native GUI application. \
-                 Call `launch` with a Cargo project directory or binary path first, then interact using `click`, `type_text`, `press_key`, `scroll`, `drag`, `capture_frames`, `wait_idle`, `rebuild`, and `close`.",
+                 Call `launch` with a Cargo project directory or binary path first, then interact using `click`, `type_text`, `press_key`, `scroll`, `drag`, `capture_frames`, `wait_idle`, `get_logs`, `rebuild`, and `close`.",
             )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleDecision {
+    Settled,
+    TimedOut,
+    KeepWaiting,
+}
+
+fn evaluate_settle_step(
+    prev: &CapturedFrame,
+    curr: &CapturedFrame,
+    elapsed: Duration,
+    max_wait: Duration,
+    threshold: f64,
+) -> SettleDecision {
+    if !frames_differ(prev, curr, threshold) {
+        SettleDecision::Settled
+    } else if elapsed >= max_wait {
+        SettleDecision::TimedOut
+    } else {
+        SettleDecision::KeepWaiting
     }
 }
 
@@ -998,5 +1136,146 @@ mod tests {
             Box::new(NoopInput),
         );
         assert_eq!(allowed.close_window_checked(Some(9999)).unwrap(), 9999);
+    }
+
+    #[test]
+    fn adaptive_settle_decision_logic() {
+        use crate::backend::CapturedFrame;
+        use std::time::Duration;
+
+        let f1 = CapturedFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![10; 16],
+        };
+        let f_same = f1.clone();
+        let mut f_diff = f1.clone();
+        f_diff.rgba[0] = 250;
+
+        assert_eq!(
+            super::evaluate_settle_step(
+                &f1,
+                &f_same,
+                Duration::from_millis(50),
+                Duration::from_millis(500),
+                0.001
+            ),
+            super::SettleDecision::Settled
+        );
+        assert_eq!(
+            super::evaluate_settle_step(
+                &f1,
+                &f_diff,
+                Duration::from_millis(200),
+                Duration::from_millis(500),
+                0.001
+            ),
+            super::SettleDecision::KeepWaiting
+        );
+        assert_eq!(
+            super::evaluate_settle_step(
+                &f1,
+                &f_diff,
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                0.001
+            ),
+            super::SettleDecision::TimedOut
+        );
+    }
+
+    #[test]
+    fn wait_idle_timeout_returns_non_fatal_latest_frame_with_note() {
+        use crate::backend::{
+            CapturedFrame, InputBackend, Modifiers, MouseButton, WindowCaptureBackend, WindowId,
+            WindowInfo, WindowRect,
+        };
+        use crate::config::Config;
+        use clap::Parser;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        struct ChangingCapture(AtomicU8);
+        impl WindowCaptureBackend for ChangingCapture {
+            fn init(&self) -> AppResult<()> {
+                Ok(())
+            }
+            fn find_window_by_pid(&self, _pid: u32) -> AppResult<Option<WindowInfo>> {
+                Ok(None)
+            }
+            fn list_windows(&self) -> AppResult<Vec<WindowInfo>> {
+                Ok(Vec::new())
+            }
+            fn get_window_info(&self, window_id: WindowId) -> AppResult<WindowInfo> {
+                Ok(WindowInfo {
+                    id: window_id,
+                    pid: 1,
+                    title: "Animated".into(),
+                    rect: WindowRect {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                    },
+                    dpi_scale: 1.0,
+                    is_minimized: false,
+                })
+            }
+            fn is_window_alive(&self, _window_id: WindowId) -> bool {
+                true
+            }
+            fn capture_window(&self, _window_id: WindowId) -> AppResult<CapturedFrame> {
+                let v = self.0.fetch_add(40, Ordering::Relaxed);
+                Ok(CapturedFrame {
+                    width: 4,
+                    height: 4,
+                    rgba: vec![v; 4 * 4 * 4],
+                })
+            }
+            fn resize_window(&self, _window_id: WindowId, _w: u32, _h: u32) -> AppResult<()> {
+                Ok(())
+            }
+            fn focus_window(&self, _window_id: WindowId) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        struct NoopInput;
+        impl InputBackend for NoopInput {
+            fn click(
+                &self,
+                _: &WindowInfo,
+                _: i32,
+                _: i32,
+                _: MouseButton,
+                _: bool,
+            ) -> AppResult<()> {
+                Ok(())
+            }
+            fn type_text(&self, _: &WindowInfo, _: &str) -> AppResult<()> {
+                Ok(())
+            }
+            fn press_key(&self, _: &WindowInfo, _: &str, _: &Modifiers) -> AppResult<()> {
+                Ok(())
+            }
+            fn scroll(&self, _: &WindowInfo, _: i32, _: i32, _: i32, _: i32) -> AppResult<()> {
+                Ok(())
+            }
+            fn drag(&self, _: &WindowInfo, _: i32, _: i32, _: i32, _: i32) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        let cfg = Config::parse_from(["rustsight", "--allow-attach"]);
+        let server = super::RustSightServer::new(
+            cfg,
+            Box::new(ChangingCapture(AtomicU8::new(0))),
+            Box::new(NoopInput),
+        );
+        let (info, _img, _elapsed, settled) = server
+            .run_wait_idle(Some(777), 80, 0.001)
+            .expect("wait_idle timeout must be non-fatal");
+        assert_eq!(info.id, 777);
+        assert!(!settled);
+        assert!(server.run_wait_idle(Some(777), 80, 1.5).is_err());
     }
 }

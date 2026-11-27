@@ -78,7 +78,7 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 
 | Tool | Description |
 | --- | --- |
-| `launch(path_or_cargo_dir, args?, width?, height?)` | Build (if Cargo project) and launch the app, returning `window_id` + first screenshot. |
+| `launch(path_or_cargo_dir, args?, width?, height?, bin?, package?, release?, features?, all_features?)` | Build (if Cargo project) and launch the app, returning `window_id` + first screenshot. |
 | `screenshot(window_id?)` | Capture a PNG screenshot of the window. |
 | `capture_frames(window_id?, duration_ms=1500, fps=10)` | Burst-capture frames, returning up to 12 PNGs + an animated GIF path on disk. |
 | `click(x, y, button?, double?, window_id?)` | Click at window-relative pixel `(x, y)` and return a fresh screenshot. |
@@ -86,13 +86,15 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 | `press_key(key, modifiers?, window_id?)` | Press a key with optional modifiers (`ctrl`, `alt`, `shift`, `win`) and return a fresh screenshot. |
 | `scroll(x, y, dx?, dy?, window_id?)` | Scroll at `(x, y)` and return a fresh screenshot. |
 | `drag(from_x, from_y, to_x, to_y, window_id?)` | Drag from `(from_x, from_y)` to `(to_x, to_y)` and return a fresh screenshot. |
-| `wait_idle(timeout_ms?, window_id?)` | Wait until consecutive frames stop changing, then return a fresh screenshot. |
+| `wait_idle(timeout_ms?, threshold?, window_id?)` | Wait until consecutive frames stop changing, then return a fresh screenshot. |
+| `get_logs(window_id?, tail?, clear?)` | Read recent stdout/stderr log lines captured from a launched app (default last 200 lines). |
 | `rebuild()` | Kill the current app, run `cargo build`, relaunch, and return a fresh screenshot. |
 | `close(window_id?)` | Close the tracked window and terminate its process. |
 
 ## CLI Flags
 
-- `--settle-ms <MS>` (default: `120`) — Wait time after input actions before taking a screenshot.
+- `--settle-ms <MS>` (default: `120`) — Minimum wait time after input actions before checking for UI settle.
+- `--settle-max-ms <MS>` (default: `1000`) — Maximum total wait time for adaptive settle after input actions before capturing.
 - `--capture-dir <PATH>` — Directory for saving animated GIFs from `capture_frames` (defaults to OS temp dir).
 - `--default-width <PX>` / `--default-height <PX>` — Default window size on `launch`.
 - `--build-timeout-secs <SECS>` (default: `300`) — Timeout for `cargo build`.

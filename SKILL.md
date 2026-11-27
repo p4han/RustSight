@@ -57,12 +57,13 @@ When the user points you to `https://github.com/p4han/RustSight` and asks you to
 
 ## Usage Workflow
 
-1. **Launch** the app under test: call `launch(path_or_cargo_dir, width?, height?)` — if given a Cargo project directory, RustSight runs `cargo build`, spawns the binary, and returns the `window_id` plus the first PNG screenshot.
+1. **Launch** the app under test: call `launch(path_or_cargo_dir, width?, height?, bin?, package?, release?, features?, all_features?)` — if given a Cargo project directory, RustSight runs `cargo build`, spawns the binary, and returns the `window_id` plus the first PNG screenshot.
 2. **Inspect & Interact**:
    - `click(x, y, button?, double?)` — click at screenshot pixel coordinates.
    - `type_text(text)` / `press_key(key, modifiers?)` — type or send shortcuts.
    - `scroll(x, y, dx?, dy?)` / `drag(from_x, from_y, to_x, to_y)` — scroll or drag.
    - `capture_frames(duration_ms?, fps?)` — inspect animations (returns up to 12 PNGs + an animated GIF path).
-   - `wait_idle(timeout_ms?)` — wait until frames stop changing.
-   Every action tool waits for the UI to settle and automatically returns a fresh PNG screenshot.
+   - `wait_idle(timeout_ms?, threshold?)` — wait until frames stop changing (non-fatal on timeout).
+   - `get_logs(window_id?, tail?, clear?)` — read buffered stdout/stderr lines from the launched app.
+   Every action tool waits adaptively for the UI to settle and automatically returns a fresh PNG screenshot.
 3. **Iterate**: edit the GUI code, call `rebuild()` to kill, recompile, and relaunch while keeping the MCP session alive, and call `close()` when finished.

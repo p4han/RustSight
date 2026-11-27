@@ -1,27 +1,127 @@
 use crate::backend::{WindowCaptureBackend, WindowId, WindowInfo};
 use crate::error::{Result, RustSightError};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+pub const MAX_LOG_LINES: usize = 2000;
+pub const MAX_LOG_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
+struct LogEntry {
+    is_stderr: bool,
+    line: String,
+}
+
+impl LogEntry {
+    fn format_line(&self) -> String {
+        if self.is_stderr {
+            format!("[stderr] {}", self.line)
+        } else {
+            self.line.clone()
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LogBuffer {
+    entries: VecDeque<LogEntry>,
+    total_bytes: usize,
+}
+
+impl LogBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, is_stderr: bool, mut line: String) {
+        if line.len() > MAX_LOG_BYTES {
+            let mut end = MAX_LOG_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+        }
+        let line_bytes = line.len();
+        while self.entries.len() >= MAX_LOG_LINES || self.total_bytes + line_bytes > MAX_LOG_BYTES {
+            if let Some(old) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(old.line.len());
+            } else {
+                break;
+            }
+        }
+        self.total_bytes += line_bytes;
+        self.entries.push_back(LogEntry { is_stderr, line });
+    }
+
+    pub fn take_tail(&mut self, tail: usize, clear: bool) -> Vec<String> {
+        let len = self.entries.len();
+        let start = len.saturating_sub(tail);
+        let out = self
+            .entries
+            .iter()
+            .skip(start)
+            .map(LogEntry::format_line)
+            .collect();
+        if clear {
+            self.entries.clear();
+            self.total_bytes = 0;
+        }
+        out
+    }
+}
+
+fn spawn_log_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    is_stderr: bool,
+    logs: Arc<Mutex<LogBuffer>>,
+) {
+    let Some(pipe) = pipe else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = buf.trim_end_matches(&['\r', '\n'][..]).to_string();
+                    let mut guard = logs.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.push(is_stderr, trimmed);
+                }
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct LaunchSpec {
     pub path_or_cargo_dir: String,
     pub args: Vec<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub bin: Option<String>,
+    pub package: Option<String>,
+    pub release: bool,
+    pub features: Vec<String>,
+    pub all_features: bool,
 }
 
 pub struct TrackedProcess {
     child: Child,
     pid: u32,
     window_id: WindowId,
+    logs: Arc<Mutex<LogBuffer>>,
     #[cfg(windows)]
     _job: Option<WindowsJob>,
 }
@@ -293,6 +393,61 @@ impl ProcessManager {
         }
         self.active_window = None;
     }
+
+    pub fn get_logs(&self, window_id: WindowId, tail: usize, clear: bool) -> Vec<String> {
+        let Some(proc) = self.processes.get(&window_id) else {
+            return Vec::new();
+        };
+        let mut guard = proc.logs.lock().unwrap_or_else(|p| p.into_inner());
+        guard.take_tail(tail, clear)
+    }
+}
+
+pub fn validate_cargo_ident(name: &str, kind: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('-')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(RustSightError::LaunchFailed(
+            name.to_string(),
+            format!(
+                "Invalid Cargo {kind} name `{name}`: must be non-empty, not start with `-`, and contain only ASCII letters, digits, `_`, `-`, or `.`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_cargo_feature(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('-')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return Err(RustSightError::LaunchFailed(
+            name.to_string(),
+            format!(
+                "Invalid Cargo feature name `{name}`: must be non-empty, not start with `-`, and contain only ASCII letters, digits, `_`, `-`, `.`, or `/`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_launch_spec(spec: &LaunchSpec) -> Result<()> {
+    if let Some(ref bin) = spec.bin {
+        validate_cargo_ident(bin, "bin")?;
+    }
+    if let Some(ref pkg) = spec.package {
+        validate_cargo_ident(pkg, "package")?;
+    }
+    for feat in &spec.features {
+        validate_cargo_feature(feat)?;
+    }
+    Ok(())
 }
 
 /// Build (if Cargo project), spawn the process, and wait for its main window without holding
@@ -321,13 +476,14 @@ pub fn prepare_launch_with<F>(
     builder: F,
 ) -> Result<PreparedLaunch>
 where
-    F: FnOnce(&Path, Duration) -> Result<PathBuf>,
+    F: FnOnce(&Path, Duration, &LaunchSpec) -> Result<PathBuf>,
 {
+    validate_launch_spec(&spec)?;
     let target = Path::new(&spec.path_or_cargo_dir);
     let manifest = detect_cargo_manifest(target);
     let exe_path = if let Some(ref manifest_path) = manifest {
         info!("Building Cargo project at {}", manifest_path.display());
-        builder(manifest_path, build_timeout)?
+        builder(manifest_path, build_timeout, &spec)?
     } else {
         if !target.exists() {
             return Err(RustSightError::BinaryNotFound(
@@ -348,16 +504,20 @@ where
     let mut cmd = Command::new(&exe_path);
     cmd.args(&spec.args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| RustSightError::LaunchFailed(exe_path.display().to_string(), e.to_string()))?;
     let pid = child.id();
+
+    let logs = Arc::new(Mutex::new(LogBuffer::new()));
+    spawn_log_reader(child.stdout.take(), false, Arc::clone(&logs));
+    spawn_log_reader(child.stderr.take(), true, Arc::clone(&logs));
 
     #[cfg(windows)]
     let job = create_kill_on_close_job(&child);
@@ -367,24 +527,48 @@ where
         child,
         pid,
         window_id: 0,
+        logs: Arc::clone(&logs),
         #[cfg(windows)]
         _job: job,
+    };
+
+    let format_recent_logs = || -> String {
+        let mut guard = logs.lock().unwrap_or_else(|p| p.into_inner());
+        let lines = guard.take_tail(40, false);
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("\nLast {} log line(s):\n{}", lines.len(), lines.join("\n"))
+        }
     };
 
     let timeout_ms = window_timeout.as_millis() as u64;
     let deadline = Instant::now() + window_timeout;
     let mut info = loop {
         if let Ok(Some(status)) = tracked.child.try_wait() {
+            std::thread::sleep(Duration::from_millis(30));
             return Err(RustSightError::LaunchFailed(
                 exe_path.display().to_string(),
-                format!("Process exited immediately with status: {status}"),
+                format!(
+                    "Process exited immediately with status: {status}{}",
+                    format_recent_logs()
+                ),
             ));
         }
         if let Some(win) = capture.find_window_by_pid(pid)? {
             break win;
         }
         if Instant::now() >= deadline {
-            return Err(RustSightError::WindowTimeout(timeout_ms, pid));
+            let log_tail = format_recent_logs();
+            if log_tail.is_empty() {
+                return Err(RustSightError::WindowTimeout(timeout_ms, pid));
+            }
+            return Err(RustSightError::LaunchFailed(
+                exe_path.display().to_string(),
+                format!(
+                    "Window did not appear within {timeout_ms} ms for process {pid}.{log_tail}"
+                ),
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -441,20 +625,84 @@ struct CargoMessage {
 #[derive(Deserialize)]
 struct CargoTarget {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     kind: Vec<String>,
 }
 
-fn build_cargo_project(manifest_path: &Path, timeout: Duration) -> Result<PathBuf> {
-    use std::io::Read;
+pub fn select_cargo_bin_artifact(
+    stdout: &str,
+    requested_bin: Option<&str>,
+    manifest_display: &str,
+) -> Result<PathBuf> {
+    let mut bins: Vec<(String, PathBuf)> = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(msg) = serde_json::from_str::<CargoMessage>(line)
+            && msg.reason == "compiler-artifact"
+            && let Some(exe) = msg.executable
+            && let Some(target) = msg.target
+            && target.kind.iter().any(|k| k == "bin")
+        {
+            bins.push((target.name, PathBuf::from(exe)));
+        }
+    }
 
-    let mut child = Command::new("cargo")
-        .arg("build")
+    if let Some(bin_name) = requested_bin {
+        if let Some((_, path)) = bins.into_iter().find(|(name, _)| name == bin_name) {
+            return Ok(path);
+        }
+        return Err(RustSightError::BinaryNotFound(
+            manifest_display.to_string(),
+            format!("Cargo build succeeded, but no binary target named `{bin_name}` was produced."),
+        ));
+    }
+
+    match bins.len() {
+        0 => Err(RustSightError::BinaryNotFound(
+            manifest_display.to_string(),
+            "Cargo build succeeded, but no binary executable artifact was produced.".to_string(),
+        )),
+        1 => Ok(bins.into_iter().next().expect("1 bin").1),
+        _ => {
+            let names: Vec<String> = bins.into_iter().map(|(n, _)| n).collect();
+            Err(RustSightError::BinaryNotFound(
+                manifest_display.to_string(),
+                format!(
+                    "Multiple binary targets were built ({}). Pass `bin` to `launch` to select one.",
+                    names.join(", ")
+                ),
+            ))
+        }
+    }
+}
+
+fn build_cargo_project(
+    manifest_path: &Path,
+    timeout: Duration,
+    spec: &LaunchSpec,
+) -> Result<PathBuf> {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
         .arg("--manifest-path")
         .arg(manifest_path)
-        .arg("--message-format=json")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .arg("--message-format=json");
+
+    if let Some(ref pkg) = spec.package {
+        cmd.arg("-p").arg(pkg);
+    }
+    if let Some(ref bin) = spec.bin {
+        cmd.arg("--bin").arg(bin);
+    }
+    if spec.release {
+        cmd.arg("--release");
+    }
+    if spec.all_features {
+        cmd.arg("--all-features");
+    } else if !spec.features.is_empty() {
+        cmd.arg("--features").arg(spec.features.join(","));
+    }
+
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
@@ -507,28 +755,11 @@ fn build_cargo_project(manifest_path: &Path, timeout: Duration) -> Result<PathBu
     }
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let mut found_exe: Option<PathBuf> = None;
-    for line in stdout.lines() {
-        if let Ok(msg) = serde_json::from_str::<CargoMessage>(line)
-            && msg.reason == "compiler-artifact"
-            && let Some(exe) = msg.executable
-        {
-            let is_bin = msg
-                .target
-                .as_ref()
-                .is_some_and(|t| t.kind.iter().any(|k| k == "bin"));
-            if is_bin {
-                found_exe = Some(PathBuf::from(exe));
-            }
-        }
-    }
-
-    found_exe.ok_or_else(|| {
-        RustSightError::BinaryNotFound(
-            manifest_path.display().to_string(),
-            "Cargo build succeeded, but no binary executable artifact was produced.".to_string(),
-        )
-    })
+    select_cargo_bin_artifact(
+        &stdout,
+        spec.bin.as_deref(),
+        &manifest_path.display().to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -590,9 +821,7 @@ mod tests {
         let manifest_dir = std::env::current_dir().unwrap();
         let spec = LaunchSpec {
             path_or_cargo_dir: manifest_dir.display().to_string(),
-            args: Vec::new(),
-            width: None,
-            height: None,
+            ..Default::default()
         };
 
         let handle = std::thread::spawn(move || {
@@ -601,7 +830,7 @@ mod tests {
                 &DummyCapture,
                 Duration::from_secs(5),
                 Duration::from_secs(1),
-                move |_manifest, _timeout| {
+                move |_manifest, _timeout, _spec| {
                     build_started_tx.send(()).unwrap();
                     allow_finish_rx.recv().unwrap();
                     Err(RustSightError::BuildFailed {
@@ -637,9 +866,7 @@ mod tests {
         let pm = ProcessManager::new();
         let spec = LaunchSpec {
             path_or_cargo_dir: "nonexistent_rustsight_binary_12345.exe".to_string(),
-            args: Vec::new(),
-            width: None,
-            height: None,
+            ..Default::default()
         };
         let res = prepare_launch(
             spec,
@@ -657,5 +884,74 @@ mod tests {
         let mut pm = ProcessManager::new();
         let res = pm.take_rebuild_target();
         assert!(matches!(res, Err(RustSightError::NothingToRebuild)));
+    }
+
+    #[test]
+    fn select_cargo_bin_artifact_handles_single_multiple_and_missing_bins() {
+        let one_bin = r#"
+{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}
+{"reason":"compiler-artifact","target":{"name":"app1","kind":["bin"]},"executable":"C:\\target\\app1.exe"}
+"#;
+        assert_eq!(
+            select_cargo_bin_artifact(one_bin, None, "Cargo.toml").unwrap(),
+            PathBuf::from("C:\\target\\app1.exe")
+        );
+
+        let multi_bin = r#"
+{"reason":"compiler-artifact","target":{"name":"app1","kind":["bin"]},"executable":"C:\\target\\app1.exe"}
+{"reason":"compiler-artifact","target":{"name":"app2","kind":["bin"]},"executable":"C:\\target\\app2.exe"}
+"#;
+        let err_multi = select_cargo_bin_artifact(multi_bin, None, "Cargo.toml").unwrap_err();
+        let msg = err_multi.to_string();
+        assert!(msg.contains("app1") && msg.contains("app2"));
+
+        assert_eq!(
+            select_cargo_bin_artifact(multi_bin, Some("app2"), "Cargo.toml").unwrap(),
+            PathBuf::from("C:\\target\\app2.exe")
+        );
+
+        let err_missing =
+            select_cargo_bin_artifact(multi_bin, Some("nope"), "Cargo.toml").unwrap_err();
+        assert!(matches!(err_missing, RustSightError::BinaryNotFound(_, _)));
+
+        let no_bin = r#"
+{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}
+"#;
+        assert!(matches!(
+            select_cargo_bin_artifact(no_bin, None, "Cargo.toml"),
+            Err(RustSightError::BinaryNotFound(_, _))
+        ));
+    }
+
+    #[test]
+    fn cargo_ident_and_feature_validation() {
+        assert!(validate_cargo_ident("my_app-1.0", "bin").is_ok());
+        assert!(validate_cargo_ident("", "bin").is_err());
+        assert!(validate_cargo_ident("--evil", "package").is_err());
+        assert!(validate_cargo_ident("foo bar", "bin").is_err());
+
+        assert!(validate_cargo_feature("dep/feat-1").is_ok());
+        assert!(validate_cargo_feature("").is_err());
+        assert!(validate_cargo_feature("-bad").is_err());
+        assert!(validate_cargo_feature("a;rm -rf").is_err());
+    }
+
+    #[test]
+    fn log_buffer_ring_limit_ordering_and_clear() {
+        let mut buf = LogBuffer::new();
+        for i in 0..(MAX_LOG_LINES + 50) {
+            buf.push(i % 2 == 1, format!("line {i}"));
+        }
+        let all = buf.take_tail(MAX_LOG_LINES + 100, false);
+        assert_eq!(all.len(), MAX_LOG_LINES);
+        assert_eq!(all[0], "line 50");
+        assert_eq!(
+            all[all.len() - 1],
+            format!("[stderr] line {}", MAX_LOG_LINES + 49)
+        );
+
+        let cleared = buf.take_tail(2, true);
+        assert_eq!(cleared.len(), 2);
+        assert!(buf.take_tail(10, false).is_empty());
     }
 }

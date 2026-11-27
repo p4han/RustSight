@@ -13,6 +13,19 @@ pub struct LaunchParams {
     pub width: Option<u32>,
     /// Optional initial window height in pixels.
     pub height: Option<u32>,
+    /// Optional Cargo binary target name (`--bin <NAME>`). Required when a Cargo build produces multiple binaries.
+    pub bin: Option<String>,
+    /// Optional Cargo package name (`-p <NAME>`).
+    pub package: Option<String>,
+    /// Build in release mode (`--release`, default: false).
+    #[serde(default)]
+    pub release: bool,
+    /// Optional Cargo features to enable (`--features ...`).
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Enable all Cargo features (`--all-features`, default: false).
+    #[serde(default)]
+    pub all_features: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -133,4 +146,17 @@ pub struct WaitIdleParams {
     pub timeout_ms: Option<u64>,
     /// Optional target window ID. Defaults to the active window.
     pub window_id: Option<WindowId>,
+    /// Fraction of changed pixels (0.0 to 1.0, default 0.001) below which consecutive frames are considered idle.
+    pub threshold: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetLogsParams {
+    /// Target window ID. Defaults to the currently active launched window.
+    pub window_id: Option<WindowId>,
+    /// Number of trailing log lines to return (default: 200).
+    pub tail: Option<usize>,
+    /// Whether to clear the log buffer after reading (default: false).
+    #[serde(default)]
+    pub clear: bool,
 }
