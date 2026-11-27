@@ -10,6 +10,8 @@ pub fn create_input_backend() -> Box<dyn InputBackend> {
     }
     #[cfg(not(windows))]
     {
-        compile_error!("Only Windows is currently supported; macOS/Linux backends can be added behind InputBackend.")
+        compile_error!(
+            "Only Windows is currently supported; macOS/Linux backends can be added behind InputBackend."
+        )
     }
 }

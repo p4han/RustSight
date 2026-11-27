@@ -19,12 +19,20 @@ pub fn create_capture_backend() -> Box<dyn WindowCaptureBackend> {
     }
     #[cfg(not(windows))]
     {
-        compile_error!("Only Windows is currently supported; macOS/Linux backends can be added behind WindowCaptureBackend.")
+        compile_error!(
+            "Only Windows is currently supported; macOS/Linux backends can be added behind WindowCaptureBackend."
+        )
     }
 }
 
 /// Crop a `CapturedFrame` to a sub-rectangle `(x, y, width, height)`, clamping to frame bounds.
-pub fn crop_frame(frame: &CapturedFrame, x: u32, y: u32, width: u32, height: u32) -> Result<CapturedFrame> {
+pub fn crop_frame(
+    frame: &CapturedFrame,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<CapturedFrame> {
     if frame.width == 0 || frame.height == 0 {
         return Err(RustSightError::Image("Cannot crop empty frame".into()));
     }
@@ -149,7 +157,13 @@ pub fn frames_differ(a: &CapturedFrame, b: &CapturedFrame, threshold_ratio: f64)
     }
 
     let mut changed = 0usize;
-    for (pa, pb) in a.rgba.chunks_exact(4).zip(b.rgba.chunks_exact(4)) {
+    for (pa, pb) in a
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.rgba.as_chunks::<4>().0.iter())
+    {
         let dr = pa[0].abs_diff(pb[0]);
         let dg = pa[1].abs_diff(pb[1]);
         let db = pa[2].abs_diff(pb[2]);

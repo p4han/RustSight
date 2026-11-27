@@ -4,10 +4,9 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
-use windows::core::{BOOL, Interface};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
-use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
@@ -17,8 +16,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIDevice, DXGI_ERROR_UNSUPPORTED};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_UNSUPPORTED, IDXGIDevice};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
@@ -38,6 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, SW_RESTORE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
     ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
+use windows::core::{BOOL, Interface};
 
 pub struct WindowsCaptureBackend;
 
@@ -148,10 +148,12 @@ impl WindowCaptureBackend for WindowsCaptureBackend {
 
         let mut out = Vec::new();
         for hwnd in hwnds {
-            if let Ok(info) = get_hwnd_info(hwnd) {
-                if !info.title.is_empty() && info.rect.width > 0 && info.rect.height > 0 {
-                    out.push(info);
-                }
+            if let Ok(info) = get_hwnd_info(hwnd)
+                && !info.title.is_empty()
+                && info.rect.width > 0
+                && info.rect.height > 0
+            {
+                out.push(info);
             }
         }
         Ok(out)
@@ -358,8 +360,8 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
 
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(|e| {
-            RustSightError::CaptureFailed(format!("IGraphicsCaptureItemInterop: {e}"))
-        })?;
+                RustSightError::CaptureFailed(format!("IGraphicsCaptureItemInterop: {e}"))
+            })?;
         let item: GraphicsCaptureItem = interop
             .CreateForWindow(hwnd)
             .map_err(|e| RustSightError::CaptureFailed(format!("CreateForWindow: {e}")))?;
@@ -379,9 +381,7 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
             1,
             size,
         )
-        .map_err(|e| {
-            RustSightError::CaptureFailed(format!("Direct3D11CaptureFramePool: {e}"))
-        })?;
+        .map_err(|e| RustSightError::CaptureFailed(format!("Direct3D11CaptureFramePool: {e}")))?;
 
         let session = pool
             .CreateCaptureSession(&item)
@@ -418,9 +418,9 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
         let access: IDirect3DDxgiInterfaceAccess = surface.cast().map_err(|e| {
             RustSightError::CaptureFailed(format!("IDirect3DDxgiInterfaceAccess: {e}"))
         })?;
-        let texture: ID3D11Texture2D = access
-            .GetInterface()
-            .map_err(|e| RustSightError::CaptureFailed(format!("GetInterface<ID3D11Texture2D>: {e}")))?;
+        let texture: ID3D11Texture2D = access.GetInterface().map_err(|e| {
+            RustSightError::CaptureFailed(format!("GetInterface<ID3D11Texture2D>: {e}"))
+        })?;
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
@@ -484,7 +484,12 @@ fn capture_with_wgc(hwnd: HWND) -> Result<CapturedFrame> {
                 (crop_w * 4) as usize,
             );
             let dst_row = &mut rgba[y * (crop_w as usize * 4)..(y + 1) * (crop_w as usize * 4)];
-            for (src_px, dst_px) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+            for (src_px, dst_px) in src_row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst_row.as_chunks_mut::<4>().0.iter_mut())
+            {
                 // BGRA -> RGBA
                 dst_px[0] = src_px[2];
                 dst_px[1] = src_px[1];
@@ -538,7 +543,9 @@ fn capture_with_print_window(hwnd: HWND) -> Result<CapturedFrame> {
         // PW_CLIENTONLY (1) | PW_RENDERFULLCONTENT (2) = 3 (client area only, no title bar)
         let ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(3)).as_bool();
         if !ok {
-            warn!("PrintWindow PW_CLIENTONLY|PW_RENDERFULLCONTENT returned false; attempting PW_CLIENTONLY=1");
+            warn!(
+                "PrintWindow PW_CLIENTONLY|PW_RENDERFULLCONTENT returned false; attempting PW_CLIENTONLY=1"
+            );
             let _ = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(1));
         }
 
@@ -546,7 +553,12 @@ fn capture_with_print_window(hwnd: HWND) -> Result<CapturedFrame> {
         let mut rgba = vec![0u8; len];
         if !bits.is_null() {
             let src = std::slice::from_raw_parts(bits as *const u8, len);
-            for (s, d) in src.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+            for (s, d) in src
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+            {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];

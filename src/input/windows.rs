@@ -3,27 +3,30 @@ use crate::error::{Result, RustSightError};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
     VIRTUAL_KEY, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6, VK_7, VK_8, VK_9, VK_A, VK_B, VK_BACK,
-    VK_C, VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F1, VK_F2,
-    VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_G, VK_H, VK_HOME,
-    VK_I, VK_INSERT, VK_J, VK_K, VK_L, VK_LEFT, VK_LWIN, VK_M, VK_MENU, VK_N, VK_NEXT, VK_O,
-    VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
-    VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_P, VK_PRIOR, VK_Q, VK_R, VK_RETURN, VK_RIGHT,
-    VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_TAB, VK_U, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z, VkKeyScanW,
+    VK_C, VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F1, VK_F2, VK_F3,
+    VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_G, VK_H, VK_HOME, VK_I,
+    VK_INSERT, VK_J, VK_K, VK_L, VK_LEFT, VK_LWIN, VK_M, VK_MENU, VK_N, VK_NEXT, VK_O, VK_OEM_1,
+    VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS,
+    VK_OEM_PERIOD, VK_OEM_PLUS, VK_P, VK_PRIOR, VK_Q, VK_R, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT,
+    VK_SPACE, VK_T, VK_TAB, VK_U, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z, VkKeyScanW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, IsIconic, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_ACTIVATE,
-    WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS,
+    BringWindowToTop, GA_ROOT, GA_ROOTOWNER, GetAncestor, GetForegroundWindow, GetSystemMetrics,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, PostMessageW, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SetForegroundWindow,
+    ShowWindow, WM_ACTIVATE, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETFOCUS,
 };
 
 pub struct WindowsInputBackend;
@@ -43,7 +46,9 @@ impl InputBackend for WindowsInputBackend {
         button: MouseButton,
         double: bool,
     ) -> Result<()> {
-        focus_hwnd(window)?;
+        if !focus_or_fallback(window, || post_click_fallback(window, x, y, button, double))? {
+            return Ok(());
+        }
         let (nx, ny) = to_virtual_desktop_coords(window, x, y);
         let (down_flag, up_flag) = match button {
             MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -87,7 +92,9 @@ impl InputBackend for WindowsInputBackend {
     }
 
     fn type_text(&self, window: &WindowInfo, text: &str) -> Result<()> {
-        focus_hwnd(window)?;
+        if !focus_or_fallback(window, || post_type_fallback(window, text))? {
+            return Ok(());
+        }
         let mut inputs = Vec::with_capacity(text.len() * 2);
         for unit in text.encode_utf16() {
             if unit == b'\n' as u16 {
@@ -107,7 +114,6 @@ impl InputBackend for WindowsInputBackend {
     }
 
     fn press_key(&self, window: &WindowInfo, key: &str, modifiers: &Modifiers) -> Result<()> {
-        focus_hwnd(window)?;
         let vk = parse_virtual_key(key)?;
 
         let mut mod_vks = Vec::new();
@@ -122,6 +128,17 @@ impl InputBackend for WindowsInputBackend {
         }
         if modifiers.meta {
             mod_vks.push(VK_LWIN);
+        }
+
+        if !focus_or_fallback(window, || {
+            if modifiers.meta {
+                return Err(RustSightError::InputFailed(
+                    "PostMessageW fallback does not support `win`/`meta` modifier shortcuts".into(),
+                ));
+            }
+            post_key_fallback(window, vk, &mod_vks)
+        })? {
+            return Ok(());
         }
 
         let mut inputs = Vec::new();
@@ -141,7 +158,9 @@ impl InputBackend for WindowsInputBackend {
     }
 
     fn scroll(&self, window: &WindowInfo, x: i32, y: i32, dx: i32, dy: i32) -> Result<()> {
-        focus_hwnd(window)?;
+        if !focus_or_fallback(window, || post_scroll_fallback(window, x, y, dx, dy))? {
+            return Ok(());
+        }
         let (nx, ny) = to_virtual_desktop_coords(window, x, y);
         let move_evt = mouse_input(
             nx,
@@ -178,7 +197,11 @@ impl InputBackend for WindowsInputBackend {
         to_x: i32,
         to_y: i32,
     ) -> Result<()> {
-        focus_hwnd(window)?;
+        if !focus_or_fallback(window, || {
+            post_drag_fallback(window, from_x, from_y, to_x, to_y)
+        })? {
+            return Ok(());
+        }
         let (start_nx, start_ny) = to_virtual_desktop_coords(window, from_x, from_y);
 
         if send_inputs(&[
@@ -226,17 +249,158 @@ impl InputBackend for WindowsInputBackend {
     }
 }
 
+const MAX_FOCUS_WAIT: Duration = Duration::from_millis(250);
+
+fn is_valid_hwnd(window: &WindowInfo) -> bool {
+    let hwnd = HWND(window.id as *mut c_void);
+    !hwnd.0.is_null() && unsafe { IsWindow(Some(hwnd)).as_bool() }
+}
+
+fn is_window_foreground(target: HWND) -> bool {
+    if target.0.is_null() {
+        return false;
+    }
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        if fg == target {
+            return true;
+        }
+        let target_root = GetAncestor(target, GA_ROOT);
+        let target_root_owner = GetAncestor(target, GA_ROOTOWNER);
+        let fg_root = GetAncestor(fg, GA_ROOT);
+        let fg_root_owner = GetAncestor(fg, GA_ROOTOWNER);
+
+        fg == target_root
+            || fg == target_root_owner
+            || fg_root == target
+            || fg_root_owner == target
+            || (!target_root.0.is_null() && target_root == fg_root)
+    }
+}
+
+fn hwnd_title(hwnd: HWND) -> String {
+    if hwnd.0.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        String::new()
+    }
+}
+
+fn try_attach_thread_focus(hwnd: HWND) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let cur_tid = GetCurrentThreadId();
+        let fg_tid = if fg.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+
+        let attached_fg =
+            fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, true).as_bool();
+        let attached_target = target_tid != 0
+            && target_tid != cur_tid
+            && target_tid != fg_tid
+            && AttachThreadInput(cur_tid, target_tid, true).as_bool();
+
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+
+        if attached_target {
+            let _ = AttachThreadInput(cur_tid, target_tid, false);
+        }
+        if attached_fg {
+            let _ = AttachThreadInput(cur_tid, fg_tid, false);
+        }
+    }
+}
+
+fn focus_or_fallback<F>(window: &WindowInfo, fallback: F) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    match focus_hwnd(window) {
+        Ok(()) => Ok(true),
+        Err(focus_err) => {
+            if !is_valid_hwnd(window) {
+                return Err(focus_err);
+            }
+            fallback().map_err(|fallback_err| {
+                RustSightError::FocusFailed(format!(
+                    "{focus_err}; PostMessageW fallback also failed: {fallback_err}"
+                ))
+            })?;
+            Ok(false)
+        }
+    }
+}
+
 fn focus_hwnd(window: &WindowInfo) -> Result<()> {
     let hwnd = HWND(window.id as *mut c_void);
+    if !is_valid_hwnd(window) {
+        return Err(RustSightError::FocusFailed(format!(
+            "Target window 0x{:x} ({:?}) is invalid or has been closed",
+            window.id, window.title
+        )));
+    }
+
     unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
             thread::sleep(Duration::from_millis(50));
+        } else if is_window_foreground(hwnd) {
+            return Ok(());
         }
+
         let _ = SetForegroundWindow(hwnd);
     }
     thread::sleep(Duration::from_millis(20));
-    Ok(())
+
+    if is_window_foreground(hwnd) {
+        return Ok(());
+    }
+
+    let retry_start = Instant::now();
+    for attempt in 0..3 {
+        if retry_start.elapsed() >= MAX_FOCUS_WAIT {
+            break;
+        }
+        match attempt {
+            0 | 2 => try_attach_thread_focus(hwnd),
+            1 => {
+                // Tapping Alt satisfies Windows' foreground lock heuristic in many desktop sessions.
+                if send_inputs(&[key_vk_input(VK_MENU, false), key_vk_input(VK_MENU, true)]).is_ok()
+                {
+                    unsafe {
+                        let _ = BringWindowToTop(hwnd);
+                        let _ = SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        thread::sleep(Duration::from_millis(25));
+        if is_window_foreground(hwnd) {
+            return Ok(());
+        }
+    }
+
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_id = fg.0 as usize;
+    let fg_title = hwnd_title(fg);
+    Err(RustSightError::FocusFailed(format!(
+        "Could not bring window 0x{:x} ({:?}) to foreground; current foreground window is 0x{:x} ({:?}). Windows may be blocking SetForegroundWindow (e.g., an elevated window is active, foreground lock is held, or the desktop is locked)",
+        window.id, window.title, fg_id, fg_title
+    )))
 }
 
 /// Convert window-relative screenshot pixel coordinates `(x, y)` to normalized `[0, 65535]`
@@ -390,19 +554,31 @@ fn post_type_fallback(window: &WindowInfo, text: &str) -> Result<()> {
         let _ = PostMessageW(Some(hwnd), WM_SETFOCUS, WPARAM(0), LPARAM(0));
         for unit in text.encode_utf16() {
             if unit == b'\n' as u16 {
-                let _ = PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(1));
-                let _ = PostMessageW(Some(hwnd), WM_KEYUP, WPARAM(VK_RETURN.0 as usize), LPARAM(1));
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_KEYDOWN,
+                    WPARAM(VK_RETURN.0 as usize),
+                    LPARAM(1),
+                );
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_KEYUP,
+                    WPARAM(VK_RETURN.0 as usize),
+                    LPARAM(1),
+                );
             } else if unit != b'\r' as u16 {
                 let vk_scan = VkKeyScanW(unit);
                 if vk_scan != -1 {
                     let vk = (vk_scan & 0xff) as usize;
                     let _ = PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(vk), LPARAM(1));
-                    PostMessageW(Some(hwnd), WM_CHAR, WPARAM(unit as usize), LPARAM(1))
-                        .map_err(|e| RustSightError::InputFailed(format!("PostMessageW WM_CHAR: {e}")))?;
+                    PostMessageW(Some(hwnd), WM_CHAR, WPARAM(unit as usize), LPARAM(1)).map_err(
+                        |e| RustSightError::InputFailed(format!("PostMessageW WM_CHAR: {e}")),
+                    )?;
                     let _ = PostMessageW(Some(hwnd), WM_KEYUP, WPARAM(vk), LPARAM(1));
                 } else {
-                    PostMessageW(Some(hwnd), WM_CHAR, WPARAM(unit as usize), LPARAM(1))
-                        .map_err(|e| RustSightError::InputFailed(format!("PostMessageW WM_CHAR: {e}")))?;
+                    PostMessageW(Some(hwnd), WM_CHAR, WPARAM(unit as usize), LPARAM(1)).map_err(
+                        |e| RustSightError::InputFailed(format!("PostMessageW WM_CHAR: {e}")),
+                    )?;
                 }
             }
         }
@@ -426,13 +602,7 @@ fn post_key_fallback(window: &WindowInfo, vk: VIRTUAL_KEY, mod_vks: &[VIRTUAL_KE
     Ok(())
 }
 
-fn post_scroll_fallback(
-    window: &WindowInfo,
-    x: i32,
-    y: i32,
-    dx: i32,
-    dy: i32,
-) -> Result<()> {
+fn post_scroll_fallback(window: &WindowInfo, x: i32, y: i32, dx: i32, dy: i32) -> Result<()> {
     let hwnd = HWND(window.id as *mut c_void);
     let (cx, cy) = to_client_coords(hwnd, window, x, y);
     let screen_lparam = make_lparam(window.rect.x + x, window.rect.y + y);
@@ -441,14 +611,16 @@ fn post_scroll_fallback(
         if dy != 0 {
             let delta = if dy.abs() <= 20 { -dy * 120 } else { -dy };
             let wparam = WPARAM((delta as i16 as u16 as usize) << 16);
-            PostMessageW(Some(hwnd), WM_MOUSEWHEEL, wparam, screen_lparam)
-                .map_err(|e| RustSightError::InputFailed(format!("PostMessageW WM_MOUSEWHEEL: {e}")))?;
+            PostMessageW(Some(hwnd), WM_MOUSEWHEEL, wparam, screen_lparam).map_err(|e| {
+                RustSightError::InputFailed(format!("PostMessageW WM_MOUSEWHEEL: {e}"))
+            })?;
         }
         if dx != 0 {
             let delta = if dx.abs() <= 20 { dx * 120 } else { dx };
             let wparam = WPARAM((delta as i16 as u16 as usize) << 16);
-            PostMessageW(Some(hwnd), WM_MOUSEHWHEEL, wparam, screen_lparam)
-                .map_err(|e| RustSightError::InputFailed(format!("PostMessageW WM_MOUSEHWHEEL: {e}")))?;
+            PostMessageW(Some(hwnd), WM_MOUSEHWHEEL, wparam, screen_lparam).map_err(|e| {
+                RustSightError::InputFailed(format!("PostMessageW WM_MOUSEHWHEEL: {e}"))
+            })?;
         }
     }
     Ok(())
@@ -466,8 +638,13 @@ fn post_drag_fallback(
     let (ex, ey) = to_client_coords(hwnd, window, to_x, to_y);
     unsafe {
         let _ = PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), make_lparam(sx, sy));
-        PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(0x0001), make_lparam(sx, sy))
-            .map_err(|e| RustSightError::InputFailed(format!("PostMessageW drag down: {e}")))?;
+        PostMessageW(
+            Some(hwnd),
+            WM_LBUTTONDOWN,
+            WPARAM(0x0001),
+            make_lparam(sx, sy),
+        )
+        .map_err(|e| RustSightError::InputFailed(format!("PostMessageW drag down: {e}")))?;
         let steps = 12;
         for step in 1..=steps {
             let t = step as f64 / steps as f64;
@@ -567,4 +744,72 @@ fn parse_virtual_key(key: &str) -> Result<VIRTUAL_KEY> {
         _ => return Err(RustSightError::InvalidKey(key.to_string())),
     };
     Ok(vk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::WindowRect;
+
+    fn dummy_window(id: u64) -> WindowInfo {
+        WindowInfo {
+            id,
+            pid: 0,
+            title: "Dummy".to_string(),
+            rect: WindowRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            dpi_scale: 1.0,
+            is_minimized: false,
+        }
+    }
+
+    #[test]
+    fn invalid_hwnd_is_not_foreground_and_focus_fails() {
+        assert!(!is_window_foreground(HWND(std::ptr::null_mut())));
+        let win = dummy_window(0);
+        let err = focus_hwnd(&win).unwrap_err();
+        assert!(matches!(err, RustSightError::FocusFailed(_)));
+    }
+
+    #[test]
+    fn input_actions_return_focus_failed_on_invalid_hwnd() {
+        let backend = WindowsInputBackend::new();
+        let win = dummy_window(0);
+        assert!(matches!(
+            backend.click(&win, 10, 10, MouseButton::Left, false),
+            Err(RustSightError::FocusFailed(_))
+        ));
+        assert!(matches!(
+            backend.type_text(&win, "hello"),
+            Err(RustSightError::FocusFailed(_))
+        ));
+        assert!(matches!(
+            backend.press_key(&win, "enter", &Modifiers::default()),
+            Err(RustSightError::FocusFailed(_))
+        ));
+        assert!(matches!(
+            backend.scroll(&win, 10, 10, 0, 1),
+            Err(RustSightError::FocusFailed(_))
+        ));
+        assert!(matches!(
+            backend.drag(&win, 10, 10, 20, 20),
+            Err(RustSightError::FocusFailed(_))
+        ));
+    }
+
+    #[test]
+    fn focus_or_fallback_runs_fallback_only_when_focus_fails() {
+        let win = dummy_window(0);
+        let mut called = false;
+        let res = focus_or_fallback(&win, || {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(res, Err(RustSightError::FocusFailed(_))));
+        assert!(!called, "fallback must not run for invalid HWND");
+    }
 }

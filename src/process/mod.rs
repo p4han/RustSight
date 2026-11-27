@@ -154,9 +154,9 @@ impl ProcessManager {
             cmd.current_dir(dir);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| RustSightError::LaunchFailed(exe_path.display().to_string(), e.to_string()))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            RustSightError::LaunchFailed(exe_path.display().to_string(), e.to_string())
+        })?;
         let pid = child.id();
 
         #[cfg(windows)]
@@ -326,7 +326,10 @@ fn build_cargo_project(manifest_path: &Path, timeout: Duration) -> Result<PathBu
             return Err(RustSightError::BuildFailed {
                 path: manifest_path.display().to_string(),
                 code: None,
-                output: format!("`cargo build` timed out after {} seconds", timeout.as_secs()),
+                output: format!(
+                    "`cargo build` timed out after {} seconds",
+                    timeout.as_secs()
+                ),
             });
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -347,17 +350,16 @@ fn build_cargo_project(manifest_path: &Path, timeout: Duration) -> Result<PathBu
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let mut found_exe: Option<PathBuf> = None;
     for line in stdout.lines() {
-        if let Ok(msg) = serde_json::from_str::<CargoMessage>(line) {
-            if msg.reason == "compiler-artifact" {
-                if let Some(exe) = msg.executable {
-                    let is_bin = msg
-                        .target
-                        .as_ref()
-                        .is_some_and(|t| t.kind.iter().any(|k| k == "bin"));
-                    if is_bin {
-                        found_exe = Some(PathBuf::from(exe));
-                    }
-                }
+        if let Ok(msg) = serde_json::from_str::<CargoMessage>(line)
+            && msg.reason == "compiler-artifact"
+            && let Some(exe) = msg.executable
+        {
+            let is_bin = msg
+                .target
+                .as_ref()
+                .is_some_and(|t| t.kind.iter().any(|k| k == "bin"));
+            if is_bin {
+                found_exe = Some(PathBuf::from(exe));
             }
         }
     }

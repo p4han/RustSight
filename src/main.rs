@@ -21,8 +21,7 @@ async fn main() -> anyhow::Result<()> {
     // MCP uses stdout for JSON-RPC messages; all logs MUST go to stderr.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
         )
         .with_writer(std::io::stderr)
         .with_ansi(false)

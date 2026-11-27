@@ -113,6 +113,7 @@ Add to your Antigravity MCP settings (`mcp_config.json`):
 ## Troubleshooting
 
 - **Clicks or keystrokes not landing**: RustSight tries OS-level `SendInput` first. If `SendInput` is blocked by Windows UIPI (e.g., an elevated window is focused or the desktop is locked/disconnected), it falls back to `PostMessageW` directly to the target `HWND`. Ensure the target app is not running elevated (as Administrator) unless `rustsight` is also elevated, and that coordinates are relative to the captured screenshot.
+- **Window focus failures**: Before sending `SendInput`, RustSight verifies with `GetForegroundWindow()` that the target window (or its root/owner) is actually in front, retrying with `AttachThreadInput` and a brief `Alt` tap if Windows refuses `SetForegroundWindow`. If focus still cannot be acquired (e.g., an elevated window holds focus or the desktop is locked), `SendInput` is skipped so input never leaks into your editor or terminal—RustSight either uses the `PostMessageW` fallback or returns a `FocusFailed` error.
 - **Build failures on `launch` or `rebuild`**: If `cargo build` fails, RustSight returns the full `rustc` stderr diagnostics directly to the agent as an actionable error message so the agent can fix the code and call `rebuild()` again.
 - **DPI scaling**: RustSight enables per-monitor DPI awareness (`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`) and uses `DWMWA_EXTENDED_FRAME_BOUNDS` so screenshot pixel coordinates map 1:1 to screen coordinates across 100%, 125%, 150%, and 200% scaling displays.
 

@@ -30,7 +30,12 @@ pub enum RustSightError {
     #[error("Input failed: {0}")]
     InputFailed(String),
 
-    #[error("Invalid key name `{0}`. Supported keys include letters, digits, enter, tab, escape, backspace, delete, space, up, down, left, right, home, end, pageup, pagedown, f1-f12.")]
+    #[error("Focus failed: {0}")]
+    FocusFailed(String),
+
+    #[error(
+        "Invalid key name `{0}`. Supported keys include letters, digits, enter, tab, escape, backspace, delete, space, up, down, left, right, home, end, pageup, pagedown, f1-f12."
+    )]
     InvalidKey(String),
 
     #[error("Invalid mouse button `{0}`. Expected `left`, `right`, or `middle`.")]
